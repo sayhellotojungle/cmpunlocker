@@ -10,6 +10,16 @@
   cmpunlocker restores numerous features that are restricted in firmware/OTP configuration of the NVIDIA CMP 170HX. cmpunlocker has been featured by multiple outlets like wccftech, Tom's Hardware and LinusTechTips.
 </p>
 
+> **P2P merged build.** This repository is a merged version that integrates the
+> GPU-to-GPU BAR1 **P2P** implementation from
+> [`bayley/cmpunlocker`](https://github.com/bayley/cmpunlocker) into the
+> patch-based `cmpunlocker` build. P2P mode is **off by default** and enabled
+> with the `--p2p` flag at install time; all original memory-geometry, PCIe Gen2
+> and passthrough unlocks are preserved. See
+> [Optional GPU-to-GPU P2P](#optional-gpu-to-gpu-p2p) for usage and
+> [docs/P2P.md](docs/P2P.md) / [docs/P2P-MERGE.zh-CN.md](docs/P2P-MERGE.zh-CN.md)
+> for the full merge and verification notes.
+
 <table>
   <tr>
     <td><a href="https://www.youtube.com/watch?v=pvSdeU13hKc" title=""><img src="https://github.com/user-attachments/assets/be0a9cab-19b6-47c4-91cd-cb6a98be406f"></a></td>
@@ -78,13 +88,17 @@ Then perform a cold reboot (full power off, then boot).
 
 ### Optional GPU-to-GPU P2P
 
+This build ships the GPU-to-GPU BAR1 P2P mode ported from
+[`bayley/cmpunlocker`](https://github.com/bayley/cmpunlocker). It is off by
+default and is turned on with the `--p2p` flag:
+
 ```bash
 sudo ./install.sh --p2p
 # Can be combined with the existing options:
 sudo ./install.sh --p2p --profile=8gb --no-passthrough
 ```
 
-`--p2p` enables the BAR1 P2P implementation from `cmpunlocker-p2p`, including
+`--p2p` enables the BAR1 P2P implementation from `bayley/cmpunlocker`, including
 capability overrides, peer mappings and page-table rewrites. It is off by
 default. Every peer GPU needs a sufficiently large BAR1 and a host PCIe path
 that carries peer traffic (BIOS must provide enough Above-4G MMIO space).
@@ -94,6 +108,38 @@ See [P2P setup and transfer verification](docs/P2P.md).
 P2P builds install the modules and module options for the next cold boot.
 Reinstall without `--p2p` to disable the optional driver patches and settings.
 Keep `--p2p` when reinstalling after a kernel upgrade.
+
+The same switch is available for direct driver builds:
+
+```bash
+sudo env CMPUNLOCKER_ENABLE_P2P=1 ./driver/build.sh
+```
+
+After a cold boot, verify real peer transfers (capability reports alone are not
+proof that data moves):
+
+```bash
+sudo ./verify.sh
+nvidia-smi topo -p2p r
+nvidia-smi topo -p2p w
+nvcc -O2 -arch=sm_80 -o /tmp/cmpunlocker-test-p2p tools/test-p2p.cu
+timeout 120s /tmp/cmpunlocker-test-p2p 0 1
+```
+
+### Optional GPUDirect Storage (GDS)
+
+```bash
+sudo ./install.sh --p2p --no-iommu
+```
+
+`--no-iommu` keeps the installer from adding IOMMU options to the kernel
+command line: GDS performs DMA straight between the NVMe device and the GPU's
+BAR1, and leaving the IOMMU out of the storage DMA path avoids the address
+translation layer in the way.
+
+This is a GDS-specific choice. Pure P2P does not need the IOMMU disabled — it
+runs fine under the default `iommu=on`/`iommu=pt`; if peer traffic is blocked,
+the cause is ACS on the intervening bridges, not the IOMMU itself.
 
 ## What Gets Unlocked
 
