@@ -105,6 +105,19 @@ that carries peer traffic (BIOS must provide enough Above-4G MMIO space).
 See [P2P setup and transfer verification](docs/P2P.md).
 中文说明：[P2P 合并与验证说明](docs/P2P-MERGE.zh-CN.md)。
 
+> [!IMPORTANT]
+> **PCIe-switch hosts: REBAR to a 64 GB BAR1 can fail.** On hosts that hang the
+> CMP GPUs behind a PCIe switch, the driver's runtime REBAR resize of BAR1 to
+> 64 GB frequently fails because the switch's MMIO window does not expose enough
+> Above-4G space for the reallocation. When that happens the BAR stays at its
+> stock size and BAR1 P2P (and the full 64 GB BAR1 window) will not work.
+>
+> - Kernel-level fix: [`bayley/cmpunlocker/kernel-patches`](https://github.com/bayley/cmpunlocker/tree/master/kernel-patches)
+>   patches the kernel to reprogram the switch windows and force the BAR1
+>   resize. It works but is heavy — a custom kernel to build and maintain.
+> - Lightweight alternative: [`cmp170hx-rebar-shim`](https://github.com/sayhellotojungle/cmp170hx-rebar-shim)
+>   reaches the same result through a small shim, without rebuilding the kernel.
+
 P2P builds install the modules and module options for the next cold boot.
 Reinstall without `--p2p` to disable the optional driver patches and settings.
 Keep `--p2p` when reinstalling after a kernel upgrade.
@@ -161,6 +174,10 @@ the cause is ACS on the intervening bridges, not the IOMMU itself.
     <td>Working ✓</td>
   </tr>
   <tr>
+    <td>Error-Correcting Code (ECC) DRAM and SRAM</td>
+    <td>Working ✓ (automatic — enabled by default, no flag)</td>
+  </tr>
+  <tr>
     <td>Full BAR1 Size (64GB)</td>
     <td>Working ✓</td>
   </tr>
@@ -185,6 +202,20 @@ the cause is ACS on the intervening bridges, not the IOMMU itself.
     <td>Working ✓</td>
   </tr>
 </table>
+
+### ECC and SM count
+
+ECC (DRAM and SRAM) and the additional SMs are part of the default patch set —
+they are applied on every install and there is no separate flag. After a reboot,
+confirm ECC is reported:
+
+```bash
+nvidia-smi -q -d ECC
+```
+
+The status may show as pending until after a cold reboot (full power off, then
+boot). "more SMs" is covered by the *Full SM compute throughput (SS0/SS1)* row
+above.
 
 ---
 
