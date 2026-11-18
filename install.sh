@@ -11,29 +11,32 @@ LOG_FILE="${LOG_DIR}/install_$(date +%Y%m%d_%H%M%S).log"
 PROFILE_OVERRIDE=""
 ENABLE_P2P=0
 CONFIGURE_IOMMU=1
-CONFIGURE_GEN2_SERVICE=1
 CONFIGURE_PASSTHROUGH=1
+DEPRECATED_GEN2_FLAG=0
 for arg in "$@"; do
     case "${arg}" in
         --profile=8gb|--profile=8GB) PROFILE_OVERRIDE="8gb" ;;
         --profile=10gb|--profile=10GB) PROFILE_OVERRIDE="10gb" ;;
         --p2p) ENABLE_P2P=1 ;;
         --no-iommu) CONFIGURE_IOMMU=0 ;;
-        --no-gen2-service) CONFIGURE_GEN2_SERVICE=0 ;;
+        --no-gen2-service) DEPRECATED_GEN2_FLAG=1 ;;
         --no-passthrough) CONFIGURE_PASSTHROUGH=0 ;;
         -h|--help)
             cat <<'EOF'
-Usage: sudo ./install.sh [--profile=8gb|10gb] [--no-iommu] [--no-gen2-service]
+Usage: sudo ./install.sh [--profile=8gb|10gb] [--no-iommu]
                         [--no-passthrough] [--p2p]
 
   --profile=8gb   Force 8GB metadata label (geometry is still chosen per PCI ID)
   --profile=10gb  Force 10GB metadata label (geometry is still chosen per PCI ID)
   --p2p          Enable GPU-to-GPU BAR1 P2P (off by default). Requires a large
-                 BAR1 and a host topology that carries peer traffic; see
-                 docs/P2P.md. Verify real peer transfers.
+                  BAR1 and a host topology that carries peer traffic; see
+                  docs/P2P.md. Verify real peer transfers.
   --no-iommu      Do not touch the kernel command line (leave IOMMU settings alone)
   --no-gen2-service
-                  Do not install the early-boot PCIe Gen2 retrain service
+                  Accepted and ignored. There is no boot-time retrain service any
+                  more: the driver retrains the link at init and an upgrade from an
+                  install that had one gets that unit disarmed. The manual helper
+                  stays installed at /usr/local/sbin/gen2-hammer.
   --no-passthrough
                   Do not set the cards up for VM passthrough. By default the
                   unlock is made to survive being handed to vfio-pci, so a VM
@@ -180,7 +183,10 @@ export CMPUNLOCKER_GPU_INVENTORY
 step "Verifying nvidia-open (${SUPPORTED_VERSIONS_CSV})"
 [[ ${#SUPPORTED_VERSIONS[@]} -gt 0 ]] || die "No supported versions listed in driver/VERSION"
 if [[ -d /sys/firmware/efi ]] && command -v mokutil &>/dev/null; then
-    if mokutil --sb-state 2>/dev/null | grep -qi 'SecureBoot enabled'; then
+    # No pipeline here on purpose: grep -q would close the pipe early, and with
+    # pipefail set that can read as "Secure Boot is off" on a machine where it is on.
+    sb_state="$(mokutil --sb-state 2>/dev/null || true)"
+    if [[ "${sb_state}" == *"SecureBoot enabled"* ]]; then
         die "Secure Boot is enabled. Disable it before installing unsigned patched modules."
     fi
 fi
@@ -237,11 +243,18 @@ if (( ENABLE_P2P == 1 )); then
 else
     info "P2P overrides disabled (use --p2p to enable)"
 fi
+if [[ "${CMPUNLOCKER_EXPERIMENTAL_GEN4:-0}" == "1" ]]; then
+    info "Asking each card for the PCIe speed its own fuses allow (cmp_pcie_gen=0)"
+else
+    info "Every card stays at Gen2 (CMPUNLOCKER_EXPERIMENTAL_GEN4=1 asks per card)"
+fi
 chmod +x "${SCRIPT_DIR}/driver/build.sh"
 CMPUNLOCKER_DRIVER_VERSION="${detected}" \
 CMPUNLOCKER_CARD_PROFILE="${CARD_PROFILE}" \
 CMPUNLOCKER_GPU_INVENTORY="${CMPUNLOCKER_GPU_INVENTORY}" \
 CMPUNLOCKER_ENABLE_P2P="${ENABLE_P2P}" \
+CMPUNLOCKER_EXPERIMENTAL_80G="${CMPUNLOCKER_EXPERIMENTAL_80G:-0}" \
+CMPUNLOCKER_EXPERIMENTAL_GEN4="${CMPUNLOCKER_EXPERIMENTAL_GEN4:-0}" \
     "${SCRIPT_DIR}/driver/build.sh"
 ok "Patched modules installed (profile ${CARD_PROFILE})"
 
@@ -259,28 +272,57 @@ else
     warn "--no-passthrough given; cards are not prepared for VM passthrough"
 fi
 
-info "Configuring PCIe Gen2 retrain service"
+info "Disarming boot-time PCIe retrain, and installing the manual helper"
 # driver/build.sh writes the combined Gen2/P2P module options before it
 # rebuilds initramfs and reloads NVIDIA. Do not overwrite those options here.
-
-for legacy_unit in cmpretrain.service cmp-gen2-retrain.service; do
+#
+# Nothing here retrains the link at boot any more, and gen2.service is in the
+# disarm list rather than the install list: nv_cmp170hx_retrain_gen2() does that
+# step from nv.c's init path, with the BAR0 writes a userspace helper cannot make,
+# and an upgrade that left the old unit enabled would retrain the link again after
+# the driver had trained it.  Measured on the bench on 2026-11-18 with the unit
+# disabled: both soft cards came up at LnkSta=0x1102 and the fused card at 0x1104,
+# with no userspace write to the link at all.
+#
+# The helper remains installed for two operations that are performed by hand after
+# boot and do not require a unit:
+#
+#   sudo /usr/local/sbin/gen2-hammer                  bring every card to its floor
+#   sudo CMP170HX_GEN2_TARGET=3 /usr/local/sbin/gen2-hammer
+#                                                     pin a card that dropped below Gen3
+#
+for legacy_unit in gen2.service cmpretrain.service cmp-gen2-retrain.service; do
     systemctl disable --now "${legacy_unit}" 2>/dev/null || true
     systemctl reset-failed "${legacy_unit}" 2>/dev/null || true
 done
-rm -f /etc/systemd/system/cmpretrain.service \
+rm -f /etc/systemd/system/gen2.service \
+      /etc/systemd/system/cmpretrain.service \
       /etc/systemd/system/cmp-gen2-retrain.service \
+      /etc/cmpunlocker/gen2.env \
       /usr/local/sbin/retrain.sh \
       /usr/local/sbin/cmp-gen2-retrain.sh
 systemctl daemon-reload
-ok "Removed legacy PCIe retrain helpers"
-
-if (( CONFIGURE_GEN2_SERVICE == 1 )); then
-    chmod +x "${SCRIPT_DIR}/tools/hammer.sh" \
-             "${SCRIPT_DIR}/tools/service.sh"
-    "${SCRIPT_DIR}/tools/service.sh" install
-    ok "Early-boot Gen2 retrain service armed (not started in this session)"
+# /etc/cmpunlocker/gen-policy is left alone: it is older than this change and the
+# helper still reads it through CMP170HX_GEN2_POLICY, so a box that pinned a card
+# keeps its pin. Nothing reads it at boot now.
+if [[ -e /etc/cmpunlocker/gen-policy ]]; then
+    info "Keeping /etc/cmpunlocker/gen-policy as the helper's per-card target list"
+fi
+if (( DEPRECATED_GEN2_FLAG == 1 )); then
+    info "--no-gen2-service is accepted and ignored: there is no retrain unit to skip"
+fi
+command -v install >/dev/null || die "install command not found"
+# -D because an installer should not require the directory to have been made by
+# somebody else; on a normal box it is already there and the flag does nothing.
+install -D -m 0755 "${SCRIPT_DIR}/tools/hammer.sh" /usr/local/sbin/gen2-hammer
+if grep -aFq 'CMP Gen2:' \
+        "/lib/modules/$(uname -r)/updates/cmpunlocker/nvidia.ko" 2>/dev/null; then
+    ok "Driver trains the link at init; /usr/local/sbin/gen2-hammer installed for manual use"
 else
-    warn "--no-gen2-service given; early-boot PCIe retraining is not installed"
+    warn "Installed module has no Gen2 probe-retrain patch: nothing trains Gen2 at boot,"
+    warn "and the helper only writes config space, so a card can sit at Gen1 until the"
+    warn "patched module is loaded. Re-run the build (see driver/build.sh) if this"
+    warn "surprises you."
 fi
 
 info "Configuring IOMMU (passthrough)"
@@ -436,18 +478,30 @@ printf "  %-16s %-8s %-8s %s\n" "BDF" "PCI ID" "Variant" "Expect MiB"
 for i in "${!GPU_BDFS[@]}"; do
     printf "  %-16s %-8s %-8s ~%s\n" "${GPU_BDFS[$i]}" "${GPU_DEVIDS[$i]}" "${GPU_PROFILES[$i]}" "${GPU_EXPECTED[$i]}"
 done
+if [[ "${CMPUNLOCKER_EXPERIMENTAL_80G:-0}" == "1" ]]; then
+    echo "  That table is the floor, not the ceiling: a card whose framebuffer fuses"
+    echo "  were burned takes the wide layout and comes up larger (80 GiB on an 8 GB"
+    echo "  SKU).  dmesg's CMP-DYN DECISION line is the per-card answer, read back"
+    echo "  from the card's own CFG1/LMR rather than from this table."
+fi
 echo ""
 echo "Next:"
 echo -e "  1. Cold reboot recommended: ${CYAN}sudo shutdown -h now${NC}  (then power on)"
 echo -e "  2. Verify all GPUs: ${CYAN}sudo ./verify.sh${NC}"
-echo -e "  3. Verify PCIe Gen2: ${CYAN}nvidia-smi --query-gpu=pcie.link.gen.current,pcie.link.gen.max --format=csv${NC}  (expect 2,2)"
+if [[ "${CMPUNLOCKER_EXPERIMENTAL_GEN4:-0}" == "1" ]]; then
+    echo -e "  3. PCIe: Gen2 or better everywhere; a card whose speed fuses were cleared asks for"
+    echo -e "     Gen4 and keeps the speed its link actually trains (Gen3 under a Gen3 bridge),"
+    echo -e "     falling back to Gen2 only if nothing above Gen2 holds.  Read the negotiated link,"
+    echo -e "     not what the SKU claims: ${CYAN}cat /sys/bus/pci/devices/<bdf>/current_link_speed${NC},"
+    echo -e "     or ${CYAN}sudo setpci -s <bdf> CAP_EXP+12.w${NC} (0x1102 Gen2, 0x1103 Gen3, 0x1104 Gen4)"
+else
+    echo -e "  3. Verify PCIe Gen2: ${CYAN}nvidia-smi --query-gpu=pcie.link.gen.current,pcie.link.gen.max --format=csv${NC}  (expect 2,2)"
+fi
 echo -e "  4. Or check manually: ${CYAN}nvidia-smi${NC}"
 echo -e "  5. Unlock logs: ${CYAN}sudo dmesg | grep SEC2_DEBUG${NC}"
 echo -e "  6. Verify IOMMU after reboot: ${CYAN}cat /proc/cmdline${NC} and ${CYAN}ls /sys/class/iommu${NC}"
-if (( CONFIGURE_GEN2_SERVICE == 1 )); then
-    echo -e "  7. Verify negotiated Gen2: ${CYAN}sudo ./tools/service.sh verify${NC}"
-    echo -e "     Recovery boot option: ${CYAN}systemd.mask=gen2.service${NC}"
-fi
+echo -e "  7. Verify the negotiated link: ${CYAN}sudo ./verify.sh${NC}  (reads LnkSta at both ends, not nvidia-smi)"
+echo -e "     Retrain a link by hand, if one ever droops: ${CYAN}sudo /usr/local/sbin/gen2-hammer${NC}"
 echo ""
 echo "This script removed the nvidia DKMS kernel modules. Re-run with the same options (including --p2p, if enabled) after each kernel upgrade."
 echo "Log saved to: ${LOG_FILE}"

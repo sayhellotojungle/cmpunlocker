@@ -17,10 +17,16 @@ import tarfile
 import tempfile
 import unittest
 
-ROOT = Path(__file__).resolve().parents[1]
+import repo
+
+ROOT = repo.ROOT
+# Counted, not typed: a patch added to PATCH_ORDER changes how many times
+# build.sh calls patch(1), and this file should follow it instead of drifting.
+BASE_PATCHES = len(repo.patch_order())
+ALL_PATCHES = BASE_PATCHES + len(repo.p2p_patch_order())
 P2P_NAMES = (
-    "0007-p2p-caps.patch", "0011-p2p-bar1.patch",
-    "0013-skip-mailbox-peer-preinit.patch", "0015-bar1p2p-readcap-override.patch",
+    "0011-p2p-bar1.patch", "0013-skip-mailbox-peer-preinit.patch",
+    "0015-bar1p2p-readcap-override.patch",
 )
 
 
@@ -76,7 +82,11 @@ elif name == "patch":
 elif name == "make":
     out = pathlib.Path.cwd() / "kernel-open/nvidia.ko"
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text("mock module; not loadable\n")
+    # The feature strings have to be in it: build.sh checks for them before it
+    # claims a build-only run proved anything, and a mock that cannot hold them
+    # would make that check pass for the wrong reason.
+    out.write_text("mock module; not loadable\n"
+                   "CMP-DYN CMP-BAR1 cmp_pcie_gen\n")
 elif name == "update-initramfs" and os.environ.get("FAIL_INITRAMFS"):
     sys.exit(1)
 elif name == "modprobe" and "-n" in sys.argv:
@@ -123,6 +133,28 @@ class P2PIntegration(unittest.TestCase):
                           text, flags=re.S)
             text = text.replace('exec > >(tee -a "${LOG_FILE}") 2>&1',
                                 '# Output captured by the test subprocess.')
+            # Anchor placement needs a real, already-patched release, and this
+            # sandbox doubles patch(1), so it doubles the placement step too.  What
+            # gets doubled is the call, not the file: the argv build.sh passes is what
+            # decides whether the optional P2P hooks are placed, and a double of
+            # apply.py itself would not have to answer for it.
+            if script.name == "build.sh":
+                assert '"--p2p=${ENABLE_P2P}"' in text, \
+                    "build.sh no longer tells the hooks which features are on"
+                double = (
+                    '# Test double for the dynfb placement step; see setUp.\n'
+                    'python3() {\n'
+                    '    if [[ "$1" == *dynfb/apply.py && "$2" != --header-dest ]]; then\n'
+                    '        printf \'{"cmd": "dynfb", "argv": "%s"}\\n\' "$*" \\\n'
+                    '            >> "${TEST_ROOT}/events.jsonl"\n'
+                    '        mkdir -p "${SRC_DIR}/$(dirname "${DYNFB_HEADER_DST}")" &&\n'
+                    '            cp "${DYNFB_DIR}/cmp_dynamic.h" "${SRC_DIR}/${DYNFB_HEADER_DST}"\n'
+                    '        return 0\n'
+                    '    fi\n'
+                    '    command python3 "$@"\n'
+                    '}\n')
+                head, _, rest = text.partition("\n")
+                text = head + "\n" + double + rest
             script.write_text(text)
         self.moddir = self.tmp / "system/lib/modules/p2p-test-kernel/updates/cmpunlocker"
         (self.moddir.parents[1] / "build").mkdir(parents=True)
@@ -137,10 +169,14 @@ class P2PIntegration(unittest.TestCase):
             path.write_text("#!" + sys.executable + "\n" + MOCK)
             path.chmod(0o755)
         self.env = {k: v for k, v in os.environ.items() if not k.startswith("CMPUNLOCKER_")}
-        self.version = (ROOT / "driver/VERSION").read_text().splitlines()[0]
+        # Any supported release will do now that the P2P set carries no version list;
+        # the first line is the one build.sh would pick on its own, and the one a
+        # branch bump changes first, so that is what this covers.
+        self.version = repo.versions()[0]
         self.env.update(PATH=str(bindir) + os.pathsep + os.environ["PATH"],
                         TEST_ROOT=str(self.tmp), TEST_VERSION=self.version,
-                        CMPUNLOCKER_TEST_EUID="0", NO_COLOR="1")
+                        CMPUNLOCKER_TEST_EUID="0", NO_COLOR="1",
+                        CMPUNLOCKER_DRIVER_VERSION=self.version)
         self.build_root = self.project / "driver/.build"
         self.build_root.mkdir()
         self.src_name = "open-gpu-kernel-modules-" + self.version
@@ -178,11 +214,50 @@ class P2PIntegration(unittest.TestCase):
 
     def test_default_and_empty_disable_all_p2p_patches(self):
         events = self.successful_build()
-        self.assertEqual(sum(e["cmd"] == "patch" for e in events), 11)
+        self.assertEqual(sum(e["cmd"] == "patch" for e in events), BASE_PATCHES)
         self.assertEqual((self.moddir / "p2p_enabled").read_text(), "0\n")
         self.assertEqual(self.conf.read_text(),
-                         'options nvidia NVreg_RegistryDwords="RmForceEnableGen2=1;RMPcieLinkSpeed=0x1"\n')
+                         'options nvidia NVreg_EnableResizableBar=1 '
+                         'NVreg_RegistryDwords="RmForceEnableGen2=1;RMPcieLinkSpeed=0x1;'
+                         'RmForceDisableIomapWC=1"\n')
         self.assertFalse(any(e["cmd"] == "patch" for e in self.successful_build("")))
+
+    def test_the_feature_is_passed_to_the_hook_placer(self):
+        """--p2p reaches the hooks, because nothing else gates them any more.
+
+        There is no version list to hide a missing feature behind: the three P2P sites
+        are anchors in the same placer as the dynamic-capacity hooks, so the command
+        line build.sh runs is the one place where "this build has no P2P in it" gets
+        decided.  Logged by the double, which sees the argv as build.sh wrote it.
+        """
+        for value, asked in (("1", "--p2p=1"), ("0", "--p2p=0")):
+            events = self.successful_build(value)
+            argv = [e["argv"] for e in events if e["cmd"] == "dynfb"]
+            self.assertEqual(len(argv), 1, "one placement step per build: %r" % argv)
+            self.assertIn(asked, argv[0].split(), "CMPUNLOCKER_ENABLE_P2P=%s" % value)
+
+    def test_build_only_reports_markers_and_installs_nothing(self):
+        """CMPUNLOCKER_BUILD_ONLY=1 proves the build and leaves the machine alone."""
+        result = self.run_script(CMPUNLOCKER_BUILD_ONLY="1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for marker in ("CMP-DYN", "CMP-BAR1", "cmp_pcie_gen"):
+            self.assertIn("nvidia.ko contains " + marker, result.stdout)
+        events = self.events(clear=True)
+        for cmd in ("depmod", "modprobe", "update-initramfs", "systemctl"):
+            self.assertEqual([e for e in events if e["cmd"] == cmd], [],
+                             "%s ran in build-only mode" % cmd)
+        self.assertFalse(self.conf.exists(), "build-only wrote the modprobe config")
+        self.assertFalse((self.moddir / "nvidia.ko").exists(), "build-only installed")
+
+    def test_dynfb_placed_after_patches_before_build(self):
+        """The hooks go in once the patch set is complete and before compiling."""
+        order = [e["cmd"] for e in self.successful_build()]
+        self.assertIn("dynfb", order)
+        self.assertLess(max(i for i, cmd in enumerate(order) if cmd == "patch"),
+                        order.index("dynfb"))
+        self.assertLess(order.index("dynfb"), order.index("make"))
+        self.assertTrue((self.tmp / "system/lib/modules/p2p-test-kernel/updates/"
+                         "cmpunlocker/nvidia.ko").is_file())
 
     def test_toggle_invalidates_cache_and_config_precedes_initramfs(self):
         self.successful_build("0")
@@ -190,8 +265,11 @@ class P2PIntegration(unittest.TestCase):
         disabled_stamp = stamp.read_text()
         events = self.successful_build("1")
         patches = [e for e in events if e["cmd"] == "patch"]
-        self.assertEqual(len(patches), 15)
-        for event, name in zip(patches[-4:], P2P_NAMES):
+        self.assertEqual(len(patches), ALL_PATCHES)
+        # The tail of the patch sequence, sized off P2P_NAMES rather than off a
+        # literal 4, so this keeps pointing at the optional set when a patch moves to
+        # or out of it.
+        for event, name in zip(patches[-len(P2P_NAMES):], P2P_NAMES):
             data = (self.project / "driver/patches/p2p" / name).read_bytes()
             self.assertEqual(event["sha256"], hashlib.sha256(data).hexdigest())
             self.assertIn("--fuzz=0", event["args"])
@@ -202,7 +280,7 @@ class P2PIntegration(unittest.TestCase):
         self.assertFalse(any(e["cmd"] == "modprobe" for e in events))
         self.assertFalse(any(e["cmd"] == "patch" for e in self.successful_build("1")))
         events = self.successful_build("0")
-        self.assertEqual(sum(e["cmd"] == "patch" for e in events), 11)
+        self.assertEqual(sum(e["cmd"] == "patch" for e in events), BASE_PATCHES)
         self.assertEqual(stamp.read_text(), disabled_stamp)
         self.assertNotIn("P2P", self.conf.read_text())
         self.assertNotIn("StaticBar1", self.conf.read_text())
@@ -213,7 +291,7 @@ class P2PIntegration(unittest.TestCase):
         patch = self.project / "driver/patches/p2p/0011-p2p-bar1.patch"
         patch.write_text("Fixture revision\n" + patch.read_text())
         events = self.successful_build("1")
-        self.assertEqual(sum(e["cmd"] == "patch" for e in events), 15)
+        self.assertEqual(sum(e["cmd"] == "patch" for e in events), ALL_PATCHES)
 
     def test_failed_patch_never_installs_or_stamps_partial_build(self):
         result = self.run_script(CMPUNLOCKER_ENABLE_P2P="1",
@@ -224,7 +302,7 @@ class P2PIntegration(unittest.TestCase):
         self.assertFalse((self.moddir / "p2p_enabled").exists())
         self.assertFalse(any(e["cmd"] == "make" for e in self.events(clear=True)))
         events = self.successful_build("1")
-        self.assertEqual(sum(e["cmd"] == "patch" for e in events), 15)
+        self.assertEqual(sum(e["cmd"] == "patch" for e in events), ALL_PATCHES)
 
     def test_installer_flag_is_authoritative_and_preserves_mixed_inventory(self):
         options = ["--no-iommu", "--no-gen2-service", "--no-passthrough"]
@@ -304,6 +382,11 @@ class P2PIntegration(unittest.TestCase):
             lines = (ROOT / "driver/patches/p2p" / name).read_text().splitlines()
             return "\n".join(line[1:] for line in lines
                              if line.startswith("+") and not line.startswith("+++"))
+
+        def payload(rel):
+            """A dynfb hook's inserted text, which is the same code from a patch now."""
+            return (ROOT / "driver/dynfb" / rel).read_text()
+
         source = '''#include <assert.h>
 typedef unsigned NvU32;
 typedef struct { struct { NvU32 PCIDeviceID; } idInfo;
@@ -311,7 +394,7 @@ typedef struct { struct { NvU32 PCIDeviceID; } idInfo;
 #define NV0000_P2P_CAPS_STATUS_OK 0
 #define NV_PRINTF(...) ((void)0)
 void caps(OBJGPU *pGpu) {
-''' + additions("0007-p2p-caps.patch") + '''
+''' + payload("hooks/p2p_caps.c") + '''
 }
 void readcap(OBJGPU *pGpu, NvU32 *pP2PReadCapStatus) {
 ''' + additions("0015-bar1p2p-readcap-override.patch") + '''

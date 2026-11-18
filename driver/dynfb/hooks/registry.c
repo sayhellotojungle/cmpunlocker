@@ -1,0 +1,2 @@
+    _kgspCmpDynAdjustRegistry(pGpu, pKernelGsp);
+

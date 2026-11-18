@@ -1,3 +1,12 @@
+BAR1 P2P: make UVM register the peer through the coherent path, and point the four
+BAR1-P2P HAL methods in nvoc's func table at the GH100 implementations.  Applied only
+when --p2p is enabled; the fifth method, kbusGetBar1P2PDmaInfo, is the hook's.
+
+Three sites this set used to patch are dynfb hooks now, because a context diff cannot
+express them: each lands where the neighbouring line is something another release
+edits.  See driver/dynfb/hooks/p2p_caps.c, p2p_resizable_bar.c and p2p_bar1dma.c, and
+the note over P2P_PATCH_ORDER in driver/build.sh.
+
 diff --git a/kernel-open/nvidia-uvm/uvm_gpu.h b/kernel-open/nvidia-uvm/uvm_gpu.h
 index dedbfcc..370a69e 100644
 --- a/kernel-open/nvidia-uvm/uvm_gpu.h
@@ -18,35 +27,10 @@ index dedbfcc..370a69e 100644
      return parent_gpu->system_bus.memory_window_end > parent_gpu->system_bus.memory_window_start;
  }
  
-diff --git a/kernel-open/nvidia/nv-reg.h b/kernel-open/nvidia/nv-reg.h
-index 93999d4..fd8359d 100644
---- a/kernel-open/nvidia/nv-reg.h
-+++ b/kernel-open/nvidia/nv-reg.h
-@@ -1051,7 +1051,10 @@ NV_DEFINE_REG_ENTRY_GLOBAL(__NV_NVLINK_DISABLE, 0);
- NV_DEFINE_REG_ENTRY_GLOBAL(__NV_ENABLE_PCIE_RELAXED_ORDERING_MODE, 0);
- NV_DEFINE_REG_ENTRY_GLOBAL(__NV_REGISTER_PCI_DRIVER, 1);
- NV_DEFINE_REG_ENTRY_GLOBAL(__NV_REGISTER_PLATFORM_DEVICE_DRIVER, 1);
--NV_DEFINE_REG_ENTRY_GLOBAL(__NV_ENABLE_RESIZABLE_BAR, 0);
-+// cmpunlocker P2P: default resizable BAR on so BAR1 P2P mappings can cover
-+// full framebuffer size out of the box (compile-time default table entry;
-+// cannot be gated by PCI device ID, see docs/P2P.md)
-+NV_DEFINE_REG_ENTRY_GLOBAL(__NV_ENABLE_RESIZABLE_BAR, 1);
- NV_DEFINE_REG_ENTRY_GLOBAL(__NV_ENABLE_DBG_BREAKPOINT, 0);
- NV_DEFINE_REG_ENTRY_GLOBAL(__NV_TEGRA_GPU_PG_MASK, 0);
- NV_DEFINE_REG_ENTRY_GLOBAL(__NV_ENABLE_NONBLOCKING_OPEN, 1);
 diff --git a/src/nvidia/generated/g_kern_bus_nvoc.c b/src/nvidia/generated/g_kern_bus_nvoc.c
 index eae6d6b..69fe272 100644
 --- a/src/nvidia/generated/g_kern_bus_nvoc.c
 +++ b/src/nvidia/generated/g_kern_bus_nvoc.c
-@@ -1066,7 +1066,7 @@ static void __nvoc_init_funcTable_KernelBus_1(KernelBus *pThis, GpuHalspecOwner
-     // default
-     else
-     {
--        pThis->__kbusGetBar1P2PDmaInfo__ = &kbusGetBar1P2PDmaInfo_395e98;
-+        pThis->__kbusGetBar1P2PDmaInfo__ = &kbusGetBar1P2PDmaInfo_GH100;
-     }
- 
-     // kbusIncreaseStaticBar1Refcount -- halified (2 hals) body
 @@ -1114,7 +1114,7 @@ static void __nvoc_init_funcTable_KernelBus_1(KernelBus *pThis, GpuHalspecOwner
      // default
      else

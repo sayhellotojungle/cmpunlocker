@@ -32,3 +32,29 @@ def patch_order():
     m = re.search(r"PATCH_ORDER=\(\n(.*?)\n\)", text, re.S)
     assert m, "PATCH_ORDER not found in driver/build.sh"
     return m.group(1).split()
+
+
+def dynfb():
+    """driver/dynfb/apply.py as a module: the hook table, not a copy of it."""
+    import importlib.util
+
+    path = ROOT / "driver" / "dynfb" / "apply.py"
+    spec = importlib.util.spec_from_file_location("dynfb_apply", str(path))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _bash_array(name):
+    """A bash array literal in driver/build.sh, either written form."""
+    text = (ROOT / "driver" / "build.sh").read_text()
+    m = re.search(r"^" + re.escape(name) + r"=\(\n(.*?)\n\)", text, re.S | re.M)
+    if m:
+        return [line.strip() for line in m.group(1).splitlines() if line.strip()]
+    m = re.search(r"^" + re.escape(name) + r"=\(([^)\n]*)\)", text, re.M)
+    assert m, "%s not found in driver/build.sh" % name
+    return m.group(1).split()
+
+
+def p2p_patch_order():
+    return _bash_array("P2P_PATCH_ORDER")

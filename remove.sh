@@ -69,7 +69,12 @@ rm -f /etc/systemd/system/cmp-gen2-retrain.service /usr/local/sbin/cmp-gen2-retr
 rm -f /etc/modprobe.d/cmp-pcie-gen2.conf
 systemctl disable --now gen2.service 2>/dev/null || true
 systemctl reset-failed gen2.service 2>/dev/null || true
+# This package no longer installs that unit: the driver retrains the link at init and
+# the helper is manual. These lines are for a box that installed it from an older
+# version and is uninstalling the newer one.
 rm -f /etc/systemd/system/gen2.service /usr/local/sbin/gen2-hammer
+rm -f /etc/cmpunlocker/gen2.env /etc/cmpunlocker/gen-policy
+rmdir /etc/cmpunlocker 2>/dev/null || true
 ok "Removed PCIe Gen2 helpers"
 
 info "Removing VM passthrough helpers"

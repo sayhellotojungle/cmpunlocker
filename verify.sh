@@ -17,7 +17,9 @@ is_unlocked_memory() {
             (( mem_mib >= 60000 )) && return 0
             ;;
         10gb)
-            (( mem_mib >= 35000 && mem_mib < 60000 )) && return 0
+            # Any unlocked size counts, including a fuse-burned card whose
+            # dynamic geometry exceeds the 40 GB profile table.
+            (( mem_mib >= 35000 )) && return 0
             ;;
     esac
     return 1
@@ -39,7 +41,7 @@ is_stock_memory() {
 }
 
 banner
-step_init 3
+step_init 4
 
 step "Locating GPU inventory"
 command -v nvidia-smi &>/dev/null || die "nvidia-smi not found"
@@ -123,6 +125,48 @@ else
     warn "No SEC2_DEBUG lines in dmesg (logs may have rotated; unlock can still be OK if memory is unlocked)"
 fi
 
+dyn_logs="$(dmesg 2>/dev/null | grep -E 'CMP-DYN|CMP-BAR1' || true)"
+if [[ -n "${dyn_logs}" ]]; then
+    ok "dmesg contains CMP-DYN per-card decisions:"
+    printf '%s\n' "${dyn_logs}" | tail -n 12 | sed 's/^/  /'
+
+    # DECISION is the last word on what a card ended up with: it reads the layout
+    # back from CFG1/LMR instead of reporting what the driver meant to write.
+    wide="$(printf '%s\n' "${dyn_logs}" | grep -c 'decision=wide-layout' || true)"
+    back="$(printf '%s\n' "${dyn_logs}" | grep -c 'stepping back to stage=' || true)"
+    bar1="$(printf '%s\n' "${dyn_logs}" | grep -c 'CMP-BAR1' || true)"
+    if (( wide > 0 )); then
+        ok "${wide} card(s) booted with the wide (80 GiB) layout"
+    else
+        info "no card took the wide layout (CMPEnable80G off, or no burned card)"
+    fi
+    if (( back > 0 )); then
+        warn "the booter gave up on a layout ${back} time(s) and stepped back; that"
+        warn "stage is recorded in the registry, so the next init starts one lower"
+        warn "the card is alive on a smaller framebuffer rather than dead"
+    fi
+    if (( bar1 > 0 )); then
+        info "${bar1} CMP-BAR1 line(s): forced static BAR1 was skipped for those"
+        info "cards (framebuffer larger than BAR1), so BAR1 P2P is off for them"
+    fi
+else
+    info "No CMP-DYN lines in dmesg (driver predates dynamic unlock, or logs rotated)"
+fi
+
+# What the link actually runs at is a separate question from the memory layout, and
+# neither nvidia-smi nor the driver's own SKU view answers it: the bridge does.  The
+# per-card table is printed below, after the memory verdict, so one failing check
+# does not hide the other.
+link_logs="$(dmesg 2>/dev/null | grep -E 'CMP Gen[0-9]:' || true)"
+if [[ -n "${link_logs}" ]]; then
+    ok "dmesg contains CMP PCIe link bring-up:"
+    printf '%s\n' "${link_logs}" | tail -n 6 | sed 's/^/  /'
+fi
+if [[ -r /sys/module/nvidia/parameters/cmp_pcie_gen ]]; then
+    info "cmp_pcie_gen=$(cat /sys/module/nvidia/parameters/cmp_pcie_gen)" \
+         "(0 asks each card for what its own fuses allow)"
+fi
+
 echo ""
 if [[ -r "${INSTALL_MOD_DIR}/card_profile" ]]; then
     info "Installed profile: $(cat "${INSTALL_MOD_DIR}/card_profile") / geometry: $(cat "${INSTALL_MOD_DIR}/unlock_geometry" 2>/dev/null || echo '?')"
@@ -144,12 +188,53 @@ fi
 echo ""
 ok "All ${#GPU_BDFS[@]} unlockable GPU(s) report unlocked memory"
 
-if [[ -x "${SCRIPT_DIR}/tools/service.sh" ]]; then
-    echo ""
-    info "Checking negotiated PCIe generation"
-    if ! "${SCRIPT_DIR}/tools/service.sh" verify; then
-        warn "Memory unlock is healthy, but PCIe Gen2 is not active"
-        exit 1
+# The link, per card.  Gen2 is the floor every CMP card has to clear. Above Gen2 the
+# target is per card: the card's fuses state what it may request and the slot states
+# what it carries, so a card at Gen4 is reported as Gen4 and a card held at Gen2 by a
+# Gen3 bridge is not a failure.  This check was previously provided by
+# tools/service.sh, the installer for the boot-time retrain unit; the driver performs
+# that retrain at init, and this section is what remains of that script.
+echo ""
+step "Checking the negotiated PCIe link"
+link_failures=0
+printf '%-16s %-16s %-10s %-14s %-8s %s\n' \
+       "GPU" "Upstream" "LnkSta" "Current speed" "Width" "Result"
+for sysdev in /sys/bus/pci/devices/*/device; do
+    device="$(cat "${sysdev}" 2>/dev/null || true)"
+    [[ "${device}" == "0x20c2" || "${device}" == "0x2082" ]] || continue
+    card="${sysdev%/device}"
+    bdf="$(basename "${card}")"
+    bridge="$(basename "$(dirname "$(readlink -f "${card}")")")"
+    speed="$(cat "${card}/current_link_speed" 2>/dev/null || echo unknown)"
+    width="$(cat "${card}/current_link_width" 2>/dev/null || echo unknown)"
+    # setpci needs root for config space, so the raw register is a bonus and sysfs is
+    # the fallback; LnkSta wins when both are available.
+    status="$(setpci -s "${bdf}" CAP_EXP+12.w 2>/dev/null || true)"
+    if [[ "${status}" =~ ^[0-9a-fA-F]{4}$ ]]; then
+        generation=$((0x${status} & 0x0f))
+        shown="0x${status}"
+    else
+        shown="n/a"
+        case "${speed}" in
+            2.5*) generation=1 ;;  5.0*)  generation=2 ;; 8.0*)  generation=3 ;;
+            16.0*) generation=4 ;; 32.0*) generation=5 ;; 64.0*) generation=6 ;;
+            *) generation="" ;;
+        esac
     fi
+    if [[ "${generation}" =~ ^[0-9]+$ ]] && (( generation >= 2 )); then
+        result="GEN${generation} OK"
+    else
+        result="below Gen2"
+        link_failures=$((link_failures + 1))
+    fi
+    printf '%-16s %-16s %-10s %-14s x%-7s %s\n' \
+           "${bdf}" "${bridge}" "${shown}" "${speed}" "${width}" "${result}"
+done
+if (( link_failures > 0 )); then
+    warn "Memory unlock is healthy, but ${link_failures} card(s) did not reach Gen2."
+    warn "sudo /usr/local/sbin/gen2-hammer retrains by hand; docs/BOOT-RECOVERY.zh-CN.md"
+    warn "says what to read before blaming the card (LnkSta at both ends, not nvidia-smi)."
+    exit 1
 fi
+ok "Every CMP card is negotiated at Gen2 or better"
 exit 0

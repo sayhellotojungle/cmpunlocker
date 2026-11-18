@@ -34,10 +34,13 @@ profiles:
 optional_features:
   p2p:
     patches:
-      - p2p/0007-p2p-caps.patch
       - p2p/0011-p2p-bar1.patch
       - p2p/0013-skip-mailbox-peer-preinit.patch
       - p2p/0015-bar1p2p-readcap-override.patch
+    # No "supports" list: the set applies to every release in driver/VERSION.  The
+    # three sites that rejected on 615.x are dynfb hooks now (dynfb/hooks/p2p_*.c),
+    # which are anchored on the line being changed instead of on whatever happened to
+    # sit next to it.  tests/test_patches.py applies the set to all of them.
 
 passthrough:
   module: cmp_no_bus_reset
@@ -102,6 +105,23 @@ unlocks:
       fuse_override: { addr: "0x8872c" }
       pl_cya_0:      { addr: "0x8c2c0" }
 
+  # Gen4 is a per-card decision, not a build choice: the target speed comes from
+  # the card's own LNKCAP2 (dynfb places the code, cmp_pcie_gen decides how far
+  # to ask).  The values below are the A100 DevInit state the VBIOS leaves out;
+  # LINK_CONFIG_0[19:18] is reverse encoded, so 0 is Gen4.  They are what the card
+  # is asked to do, not where it is left: if the link trains below the target, the
+  # rate fields are rewritten to the speed it actually holds, and only a link that
+  # cannot hold Gen3 goes back to the Gen2 recipe.
+  gen4_pcie:
+    source: dynfb/hooks/nv_gen4.c
+    fallback: keep the trained speed down to Gen3, else the Gen2 recipe
+    registers:
+      link_config_0: { addr: "0x8c040" }
+      pl_cya_0:      { addr: "0x8c2c0", value: "0x060711b2" }
+      pl_link_rate:  { addr: "0x8c1c0", value: "0x00040036" }
+      xp_eq_config:  { addr: "0x88ce4", value: "0x00000014" }
+      fuse_override: { addr: "0x8872c", value: "0x00000008" }
+
   bar1_resize:
     patch: bar1-resize-unlock.patch
     registers: {}
@@ -133,6 +153,16 @@ unlocks:
   cmp-sku-mask:
     patch: cmp-sku-mask.patch
     registers: {}
+
+  # The burn signal and the capacity are read from these two words, so the policy
+  # has to carry both layouts it can program.  It lives in a source file that
+  # build.sh drops into the tree, not in a patch.
+  dynamic:
+    source: dynfb/cmp_dynamic.h
+    registers:
+      fb_cfg1:     { addr: "0x009a0204", value: "0x02779000" }
+      fb_lmr_64g:  { addr: "0x00100ce0", value: "0x0000020b" }
+      fb_lmr_80g:  { addr: "0x00100ce0", value: "0x0000028b" }
 
 
   ecc:

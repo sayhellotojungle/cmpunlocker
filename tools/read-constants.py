@@ -29,13 +29,23 @@ def present(blob_lower, value):
     return any(re.search(re.escape(f) + r"u?\b", blob_lower) for f in forms)
 
 
-def read_patch_order(build_sh, array_name="PATCH_ORDER"):
+def read_patch_order(build_sh, array_name="PATCH_ORDER", pattern=None):
+    """A bash array literal, written one item per line or on a single line."""
     text = io.open(build_sh, encoding="utf-8").read()
-    m = re.search(r"^" + re.escape(array_name) + r"=\(\n(.*?)\n\)",
-                  text, re.S | re.M)
-    if not m:
-        sys.exit("error: %s not found in %s" % (array_name, build_sh))
-    return [l.strip() for l in m.group(1).splitlines() if l.strip()]
+    name = re.escape(array_name)
+    m = re.search(r"^" + name + r"=\(\n(.*?)\n\)", text, re.S | re.M)
+    if m is None:
+        m = re.search(r"^" + name + r"=\(([^)\n]*)\)", text, re.M)
+        if m is None:
+            sys.exit("error: %s not found in %s" % (array_name, build_sh))
+        return [item for item in m.group(1).split() if item]
+    items = [l.strip() for l in m.group(1).splitlines() if l.strip()]
+    if pattern:
+        problems = [l for l in items if not re.fullmatch(pattern, l)]
+        if problems:
+            sys.exit("error: %s has entries that are not %s: %s"
+                     % (array_name, pattern, ", ".join(problems)))
+    return items
 
 
 def main():
@@ -83,11 +93,15 @@ def main():
     cache = {}
     for uname in sorted(unlocks):
         u = unlocks[uname] or {}
-        pname = u.get("patch")
+        pname = u.get("patch") or u.get("source")
         if not pname:
-            problems.append("unlock %s has no patch" % uname)
+            problems.append("unlock %s has no patch or source" % uname)
             continue
-        ppath = os.path.join(patch_dir, pname)
+        # "source" names the file the feature actually lives in (dynfb's policy
+        # header) instead of a patch that carries it; either way the registers it
+        # claims have to appear in that file.
+        ppath = (os.path.join(patch_dir, pname) if u.get("patch")
+                 else os.path.join(os.path.dirname(patch_dir), pname))
         if not os.path.isfile(ppath):
             problems.append("unlock %s: missing %s" % (uname, ppath))
             continue

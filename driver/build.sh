@@ -6,13 +6,16 @@ mapfile -t SUPPORTED_VERSIONS < <(grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' "${SCRIPT_D
 DEFAULT_VERSION="${SUPPORTED_VERSIONS[0]:-}"
 VERSION="${CMPUNLOCKER_DRIVER_VERSION:-${DEFAULT_VERSION}}"
 ENABLE_P2P="${CMPUNLOCKER_ENABLE_P2P:-0}"
+ENABLE_80G="${CMPUNLOCKER_EXPERIMENTAL_80G:-0}"
+ENABLE_GEN4="${CMPUNLOCKER_EXPERIMENTAL_GEN4:-0}"
 PATCH_DIR="${SCRIPT_DIR}/patches"
 BUILD_ROOT="${CMPUNLOCKER_BUILD_DIR:-${SCRIPT_DIR}/.build}"
 SRC_NAME="open-gpu-kernel-modules-${VERSION}"
 SRC_DIR="${BUILD_ROOT}/${SRC_NAME}"
 TARBALL="${BUILD_ROOT}/${SRC_NAME}.tar.gz"
 TARBALL_URL="https://github.com/NVIDIA/open-gpu-kernel-modules/archive/refs/tags/${VERSION}.tar.gz"
-KVER="$(uname -r)"
+KVER="${CMPUNLOCKER_KVER:-$(uname -r)}"
+BUILD_ONLY="${CMPUNLOCKER_BUILD_ONLY:-0}"
 KSRC="/lib/modules/${KVER}/build"
 INSTALL_MOD_DIR="/lib/modules/${KVER}/updates/cmpunlocker"
 PREVIOUS_P2P="$(cat "${INSTALL_MOD_DIR}/p2p_enabled" 2>/dev/null || true)"
@@ -40,6 +43,18 @@ version_supported() {
 case "${ENABLE_P2P}" in
     0|1) ;;
     *) die "CMPUNLOCKER_ENABLE_P2P must be 0 or 1 (got: '${ENABLE_P2P}')" ;;
+esac
+case "${ENABLE_80G}" in
+    0|1) ;;
+    *) die "CMPUNLOCKER_EXPERIMENTAL_80G must be 0 or 1" ;;
+esac
+case "${ENABLE_GEN4}" in
+    0|1) ;;
+    *) die "CMPUNLOCKER_EXPERIMENTAL_GEN4 must be 0 or 1" ;;
+esac
+case "${BUILD_ONLY}" in
+    0|1) ;;
+    *) die "CMPUNLOCKER_BUILD_ONLY must be 0 or 1" ;;
 esac
 
 [[ "${EUID}" -eq 0 ]] || die "Run as root: sudo ${SCRIPT_DIR}/build.sh"
@@ -69,11 +84,23 @@ PATCH_ORDER=(
     ecc-reporting.patch
 )
 P2P_PATCH_ORDER=(
-    p2p/0007-p2p-caps.patch
     p2p/0011-p2p-bar1.patch
     p2p/0013-skip-mailbox-peer-preinit.patch
     p2p/0015-bar1p2p-readcap-override.patch
 )
+# The P2P set has no version gate: every hunk of it, and the three dynfb hooks the
+# feature adds, places on every release in driver/VERSION.  tests/test_patches.py
+# applies the whole set against all of them with --fuzz=0, which is what keeps this
+# claim honest across a branch bump.
+#
+# Three sites used to reject on 615.x and are dynfb hooks now, because a context diff
+# cannot express them: each lands where the neighbouring line is something another
+# release edits.  615 added a line below the P2P caps assignments, edited an
+# unrelated registry default two lines below the resizable-BAR default, and
+# regenerated a func table with one more method between the entry and the comment the
+# hunk carried.  None of that was a P2P change; the hunks only asked for context they
+# had no right to.  A branch that really does move one of these sites is now a build
+# error naming the hook, rather than a release nobody is allowed to build P2P on.
 if [[ "${ENABLE_P2P}" -eq 1 ]]; then
     PATCH_ORDER+=("${P2P_PATCH_ORDER[@]}")
     info "GPU-to-GPU BAR1 P2P enabled"
@@ -86,7 +113,18 @@ for name in "${PATCH_ORDER[@]}"; do
     [[ -f "${p}" ]] || die "Missing patch: ${p}"
     PATCH_FILES+=("${p}")
 done
-PATCH_HASH="$(cat "${PATCH_FILES[@]}" | sha256sum | cut -d' ' -f1)"
+# The dynamic policy is not a patch, so it has to enter the cache key itself:
+# without this, editing cmp_dynamic.h reuses a stale tree and the change silently
+# does not reach the built module.
+DYNFB_DIR="${SCRIPT_DIR}/dynfb"
+DYNFB_HEADER_DST="$(python3 "${DYNFB_DIR}/apply.py" --header-dest)" ||
+    die "dynfb/apply.py does not report its header destination"
+DYNFB_HASH_FILES=("${DYNFB_DIR}/apply.py" "${DYNFB_DIR}/cmp_dynamic.h")
+while IFS= read -r -d '' f; do
+    DYNFB_HASH_FILES+=("${f}")
+done < <(find "${DYNFB_DIR}/hooks" -type f -print0 | sort -z)
+PATCH_HASH="$(cat "${PATCH_FILES[@]}" "${DYNFB_HASH_FILES[@]}" |
+              sha256sum | cut -d' ' -f1)"
 
 PROFILE="${CMPUNLOCKER_CARD_PROFILE:-8gb}"
 case "${PROFILE}" in
@@ -100,7 +138,7 @@ CONSTANTS="${SCRIPT_DIR}/../common/constants.yaml"
 CONSTANTS_ENV="$(python3 "${SCRIPT_DIR}/../tools/read-constants.py" "${CONSTANTS}" "${PATCH_DIR}" "${SCRIPT_DIR}/build.sh" "${PROFILE}")" || die "common/constants.yaml rejected (see error above)"
 eval "${CONSTANTS_ENV}"
 
-BUILD_STAMP="${VERSION}:${KVER}:${PROFILE}:p2p=${ENABLE_P2P}:${PATCH_HASH}:$(sha256sum "${SCRIPT_DIR}/build.sh" | cut -d' ' -f1)"
+BUILD_STAMP="${VERSION}:${KVER}:${PROFILE}:p2p=${ENABLE_P2P}:experimental80g=${ENABLE_80G}:${PATCH_HASH}:$(sha256sum "${SCRIPT_DIR}/build.sh" | cut -d' ' -f1)"
 
 mkdir -p "${BUILD_ROOT}"
 
@@ -143,8 +181,36 @@ else
     done
     ok "All patches applied"
 
+    # The per-card capacity policy is placed by anchor rather than by a patch:
+    # dynfb/apply.py copies its header into the tree and checks every hook
+    # landed, so a driver release that moved the code costs a line number, not a
+    # silently misplaced hunk.
+    python3 "${DYNFB_DIR}/apply.py" "--p2p=${ENABLE_P2P}" "${SRC_DIR}" ||
+        die "dynfb hooks did not land"
+    DYNFB_H="${SRC_DIR}/${DYNFB_HEADER_DST}"
+
     GSP_C="${SRC_DIR}/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c"
     [[ -f "${GSP_C}" ]] || die "Missing ${GSP_C} after patching"
+    [[ -f "${DYNFB_H}" ]] || die "Missing ${DYNFB_H} after dynfb"
+    # The wide geometry is opt-in twice over: the card has to report the extra
+    # FBP pair in NV_PFB_PRI_MMU_LOCAL_MEMORY_RANGE (LMR), and RegistryDwords has
+    # to carry CMPEnable80G=1 (added below).  Unburned cards never take the path,
+    # so the path is compiled in and only switched on by request.
+    python3 - "${DYNFB_H}" "${ENABLE_80G}" <<'PY'
+import pathlib, re, sys
+path, want = pathlib.Path(sys.argv[1]), sys.argv[2]
+text = path.read_text()
+text2, n = re.subn(r"#define CMP_DYN_ENABLE_80G\s+[01]",
+                   "#define CMP_DYN_ENABLE_80G       %s" % want, text, count=1)
+if n != 1:
+    print("CMP-DYN: no 80 GiB switch in this tree; leaving as patched")
+else:
+    path.write_text(text2)
+    print("CMP-DYN: 80 GiB capacity path = %s" % want)
+PY
+    if [[ "${ENABLE_80G}" -eq 0 ]]; then
+        info "80 GiB capacity path off; a burned card keeps the 64 GiB layout"
+    fi
 
     info "Applying memory profile ${PROFILE} (${UNLOCK_LABEL} geometry)..."
     if [[ "${SKIP_GEOMETRY_REWRITE}" -eq 1 ]]; then
@@ -197,15 +263,17 @@ PY
 fi
 
 cd "${SRC_DIR}"
-mkdir -p "${INSTALL_MOD_DIR}"
-printf '%s\n' "${VERSION}" > "${INSTALL_MOD_DIR}/driver_version"
-printf '%s\n' "${PROFILE}" > "${INSTALL_MOD_DIR}/card_profile"
-printf '%s\n' "${UNLOCK_LABEL}" > "${INSTALL_MOD_DIR}/unlock_geometry"
-if [[ -n "${CMPUNLOCKER_GPU_INVENTORY:-}" ]]; then
-    printf '%s\n' "${CMPUNLOCKER_GPU_INVENTORY}" > "${INSTALL_MOD_DIR}/gpu_inventory"
-    ok "Wrote gpu_inventory ($(echo "${CMPUNLOCKER_GPU_INVENTORY}" | grep -c . || true) GPU(s))"
-else
-    : > "${INSTALL_MOD_DIR}/gpu_inventory"
+if [[ "${BUILD_ONLY}" -eq 0 ]]; then
+    mkdir -p "${INSTALL_MOD_DIR}"
+    printf '%s\n' "${VERSION}" > "${INSTALL_MOD_DIR}/driver_version"
+    printf '%s\n' "${PROFILE}" > "${INSTALL_MOD_DIR}/card_profile"
+    printf '%s\n' "${UNLOCK_LABEL}" > "${INSTALL_MOD_DIR}/unlock_geometry"
+    if [[ -n "${CMPUNLOCKER_GPU_INVENTORY:-}" ]]; then
+        printf '%s\n' "${CMPUNLOCKER_GPU_INVENTORY}" > "${INSTALL_MOD_DIR}/gpu_inventory"
+        ok "Wrote gpu_inventory ($(echo "${CMPUNLOCKER_GPU_INVENTORY}" | grep -c . || true) GPU(s))"
+    else
+        : > "${INSTALL_MOD_DIR}/gpu_inventory"
+    fi
 fi
 
 info "Building modules for kernel ${KVER}..."
@@ -227,6 +295,32 @@ ok "Modules built"
 if command -v ccache &>/dev/null; then
     ccache -s 2>/dev/null | sed 's/^/  /' || true
 fi
+
+if [[ "${BUILD_ONLY}" -eq 1 ]]; then
+    # Nothing was installed and this machine's modules, initramfs and modprobe
+    # config are untouched, so say what the build proves and stop here. The markers
+    # are the difference between "it compiled" and "this change reached the module":
+    # a hook that stopped applying still compiles, and so does a policy header that
+    # nobody includes. Look for data, not code symbols: a feature string and a
+    # module parameter both survive a stripped module, a static function name does
+    # not. And grep the file rather than strings | grep, because with pipefail set
+    # grep -q closes the pipe on its first match and strings dies of SIGPIPE, which
+    # reads back as "marker missing" on a module that has it.
+    MODULES=()
+    while IFS= read -r candidate; do
+        MODULES+=("${candidate}")
+    done < <(find . -name nvidia.ko -not -path '*/conftest/*')
+    [[ ${#MODULES[@]} -gt 0 ]] || die "Build produced no nvidia.ko"
+    for marker in 'CMP-DYN' 'CMP-BAR1' 'cmp_pcie_gen'; do
+        if grep -a -q -- "${marker}" "${MODULES[@]}"; then
+            ok "nvidia.ko contains ${marker}"
+        else
+            die "nvidia.ko does not contain ${marker}; the change did not reach the module"
+        fi
+    done
+    ok "Build only: module at ${SRC_DIR}/${MODULES[0]#"./"}; nothing installed"
+    exit 0
+fi
 info "Installing modules to ${INSTALL_MOD_DIR}..."
 mkdir -p "${INSTALL_MOD_DIR}"
 
@@ -245,15 +339,42 @@ done
 # Keep one RegistryDwords option: separate modprobe entries can replace each
 # other. Rewrite it on every install so a later build without P2P removes the
 # static-BAR1/P2P settings. This must precede initramfs generation and modprobe.
-REGISTRY_DWORDS="RmForceEnableGen2=1;RMPcieLinkSpeed=0x1"
+# RMPcieLinkSpeed is a MAX-speed allow-mask and the one PCIe knob RM itself
+# honours, so it has to agree with what the link code does.  0x1 is the value
+# verified with the GDS/P2PDMA host path on the reference rig: RM never asks for
+# more than the Gen2 link that pcie-gen2.patch and the early-boot retrain helper
+# produce.  0xF goes with the Gen4 bring-up (dynfb), which trains the link itself
+# and only on a card whose PCIe speed fuses allow it; on any other card RM would
+# ask for a speed the PHY cannot train.  Do not drop the key entirely:
+# SET_PCIE_SPEED then fails with NV_ERR_NOT_SUPPORTED.
+# RmForceDisableIomapWC=1 and NVreg_EnableResizableBar=1 are required by the
+# GPUDirect-Storage / P2PDMA host path (verified on the reference rig).
+REGISTRY_SPEED="0x1"
+MODULE_PARAMS=""
+if [[ "${ENABLE_GEN4}" -eq 1 ]]; then
+    # cmp_pcie_gen=0 asks for whatever each card's own fuses allow, which is what
+    # a box with both burned and soft-unlocked cards needs: the soft ones stay on
+    # Gen2 and are never asked to train.  Set cmp_pcie_gen=2 here to keep every
+    # card at Gen2, or 3/4 to ask every 0x20C2 for that speed.
+    REGISTRY_SPEED="0xF"
+    MODULE_PARAMS="cmp_pcie_gen=0 "
+fi
+REGISTRY_DWORDS="RmForceEnableGen2=1;RMPcieLinkSpeed=${REGISTRY_SPEED};RmForceDisableIomapWC=1"
+if [[ "${ENABLE_80G}" -eq 1 ]]; then
+    # Opt-in for the wide (80 GiB) geometry in the dynamic policy (dynfb).
+    # Without this key the burned card stays on the 64 GiB layout, so the
+    # experiment can be turned off from this file alone, no rebuild needed.
+    REGISTRY_DWORDS+=";CMPEnable80G=1"
+fi
 if [[ "${ENABLE_P2P}" -eq 1 ]]; then
     REGISTRY_DWORDS+=";RMForceStaticBar1=1;RMPcieP2PType=1"
 fi
 mkdir -p /etc/modprobe.d
-printf 'options nvidia NVreg_RegistryDwords="%s"\n' "${REGISTRY_DWORDS}" \
+printf 'options nvidia %sNVreg_EnableResizableBar=1 NVreg_RegistryDwords="%s"\n' \
+    "${MODULE_PARAMS}" "${REGISTRY_DWORDS}" \
     > /etc/modprobe.d/cmp-pcie-gen2.conf
 printf '%s\n' "${ENABLE_P2P}" > "${INSTALL_MOD_DIR}/p2p_enabled"
-ok "Configured Gen2/P2P module options (P2P=${ENABLE_P2P})"
+ok "Configured Gen2/P2P module options (P2P=${ENABLE_P2P}, Gen4=${ENABLE_GEN4})"
 
 depmod -a "${KVER}"
 ok "depmod complete"
