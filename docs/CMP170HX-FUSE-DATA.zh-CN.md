@@ -153,6 +153,34 @@ DWORD 键的 `data` 就是值本身，`nameOffset` 指向表尾 blob 里的 NUL 
 `RegistryDwordsPerDevice="pci=DDDD:BB:DD.F;..."` 也是可用的逐设备入口（`nvp->pRegistry`
 会一起打包），但 05/06/09 三张卡 device id 相同，只有 BDF 可分，故本项目选择了代码内改写。
 
+## `bBurned` 的判据本身有竞态（2026-11-21 观测）
+
+`_kgspCmpDynGeomEval()` 只在 `bBurned == 0` 时抓一次快照，而它读的是 `CFG1`/`LMR` ——
+这两个恰恰是**我们自己会写**的活寄存器，`_kgspCmpDynIsBurned()` 的判据又只是"当前 LMR
+的 FBP 数是否大于 8"。于是这个位取决于钩子落在几何写之前还是之后，而不是取决于熔丝：
+
+| 快照时机 | 读到的 LMR | 判定 |
+| --- | --- | --- |
+| 几何写之前 | 熔丝原值（05/06 出厂即 `0x00000288`，10 分区） | `burned=1`，描述的是卡 |
+| 80 GiB stage 写之后 | `0x00000288`（我们的宽几何，与熔丝值同号） | `burned=1`，结论对，但 `CMP-DYN FUSES` 打印的是我们写的值 |
+| 64 GiB stage 写之后 | `0x0000020b`（我们的合成 8 分区） | `burned=0`，一张确有富余分区的卡被认成无解 |
+
+实测：2026-11-21 一次不带 `CMPEnable80G=1` 的启动（stage=64g），同一批卡、同一份熔丝，
+GPU0 报 `burned=1`，GPU1 报 `LMR=0x0000020b burned=0` —— 差别只在两张卡各自第一次
+eval 的时机。那一次 stage 本来就是 64g，`burned` 没参与决策，症状只是 dmesg 把我们的
+几何当成熔丝内容报了出来；隐患在别处：
+
+- `_kgspCmpDynNoteFailure()` 在 `bBurned == 0` 时直接返回，也就是说 **booter 超时后的
+  自动降级台阶是以这个可能出错的位为前提的**：被判成未烧写的卡没有退路，只有那一次
+  geometry 可试。当天卡死的那次是 booter `0xffff`，不是 falcon 超时，本来就不走台阶，
+  所以这不是当天的病因，而是这条安全网的可信度问题。
+- `_kgspCmpDynAdjustRegistry()` 把静态 BAR1 降级也挂在同一位上（外加 `stage == 80G`），
+  判错时该降的没降，退化为 GSP-RM 自己报的硬失败。
+
+要修得把判据与活寄存器解耦：从熔丝控制器的 `CMD_READ` 取真值（本文"只读采集"那节用的
+`ffprobe` 已经证明读得到 `0x00000288`，不依赖 BAR0 几何），或把快照钉在一个保证早于
+任何几何写的位置，并在日志里标明这个值究竟来自熔丝还是寄存器回读。
+
 ## 运行时开关（无需重编即可回退）
 
 `build.sh` 在 `CMPUNLOCKER_EXPERIMENTAL_80G=1` 时往 `RegistryDwords` 里加 `CMPEnable80G=1`：
