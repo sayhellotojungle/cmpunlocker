@@ -1,0 +1,55 @@
+CMP mailbox P2P: open the privilege mask of PRI decode trap 31.
+
+The trap that 0020-mailbox-trap31.patch arms lives behind its own
+PRIV_LEVEL_MASK at 0x0012277c, and level 0 cannot open the mask of the block
+that decides who may write the block.  The SEC2 booter replay this file already
+runs for the other twelve masks is the only way in, so the trap's mask joins
+that table.
+
+It is opened only when RegistryDwords carries CMPEnableP2PMailbox=1, which is
+what driver/build.sh writes for --p2p=mailbox, so a plain install never asks
+the booter to open it.  Applied only with --p2p=mailbox.
+--- a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
++++ b/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
+@@ -4887,6 +4887,7 @@
+             { 0x008200d8U, 0xffffffffU, "RECONFIG_PLM" },
+             { 0x0000c840U, 0xffffffffU, "PJTAG_PLM" },
+             { 0x0000c848U, 0xffffffffU, "PJTAG_SEC_PLM" },
++            { 0x0012277cU, 0xffffffffU, "TRAP31_PLM" },
+         };
+ 
+         NvU32 wpr2Lo = GPU_REG_RD32(pGpu, 0x001fa824U);
+@@ -4895,9 +4896,32 @@
+                   "SEC2_DEBUG: saved WPR2 lo=0x%08x hi=0x%08x\n",
+                   wpr2Lo, wpr2Hi);
+ 
+-        for (plmIdx = 0; plmIdx < 12; plmIdx++)
++        for (plmIdx = 0; plmIdx < 13; plmIdx++)
+         {
+             NvBool opened = NV_FALSE;
++
++            /*
++             * PRI decode trap 31 is what lets the P2P mailbox setup reach
++             * the NV_P2P block (p2p/0020-mailbox-trap31.patch), and its
++             * own mask is the only row here a card can live without.  It
++             * is opened for that feature alone, so a plain install never
++             * asks the booter to touch it.
++             */
++            if (plmTable[plmIdx].addr == 0x0012277cU)
++            {
++                NvU32 cmpP2PMailbox = 0;
++
++                (void) osReadRegistryDword(pGpu, "CMPEnableP2PMailbox",
++                                           &cmpP2PMailbox);
++                if (cmpP2PMailbox != 1)
++                {
++                    NV_PRINTF(LEVEL_ERROR,
++                              "SEC2_DEBUG: TRAP31_PLM left closed "
++                              "(CMPEnableP2PMailbox not set)\n");
++                    continue;
++                }
++            }
++
+             for (attempt = 0; attempt < 2 && !opened; attempt++)
+             {
+                 GPU_REG_WR32(pGpu, 0x001fa824U, wpr2Lo);

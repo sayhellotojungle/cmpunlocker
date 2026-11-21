@@ -75,13 +75,23 @@ def main():
     declared = {u["patch"] for u in unlocks.values() if u.get("patch")}
 
     problems = []
-    p2p_order = read_patch_order(build_sh, "P2P_PATCH_ORDER")
-    p2p_declared = ((c.get("optional_features") or {}).get("p2p") or {}).get("patches", [])
-    if p2p_order != p2p_declared:
-        problems.append("optional_features.p2p.patches does not match P2P_PATCH_ORDER")
-    for pname in p2p_order:
-        if not os.path.isfile(os.path.join(patch_dir, pname)):
-            problems.append("optional P2P patch missing: %s" % pname)
+    # P2P is two feature sets behind one option, and both lists are checked on
+    # every build, not just the one this build selected: a tree that lost a patch
+    # nobody happens to be building today is still a tree that cannot build it
+    # tomorrow, and the point of this file is to say so before someone tries.
+    p2p = (c.get("optional_features") or {}).get("p2p") or {}
+    for mode, array in (("bar1", "P2P_BAR1_PATCH_ORDER"),
+                        ("mailbox", "P2P_MAILBOX_PATCH_ORDER")):
+        listed = (p2p.get(mode) or {}).get("patches", [])
+        built = read_patch_order(build_sh, array)
+        if built != listed:
+            problems.append("optional_features.p2p.%s.patches does not match %s"
+                            % (mode, array))
+        for pname in sorted(set(built) | set(listed)):
+            if not os.path.isfile(os.path.join(patch_dir, pname)):
+                problems.append("optional P2P patch missing: %s" % pname)
+    if not any((p2p.get(m) or {}).get("patches") for m in ("bar1", "mailbox")):
+        problems.append("optional_features.p2p declares no patches for either path")
 
     for name in sorted(set(order) - declared):
         problems.append("patch %s is built but not declared in constants.yaml"

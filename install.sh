@@ -9,7 +9,7 @@ mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/install_$(date +%Y%m%d_%H%M%S).log"
 
 PROFILE_OVERRIDE=""
-ENABLE_P2P=0
+P2P_MODE=off
 CONFIGURE_IOMMU=1
 CONFIGURE_PASSTHROUGH=1
 DEPRECATED_GEN2_FLAG=0
@@ -17,20 +17,44 @@ for arg in "$@"; do
     case "${arg}" in
         --profile=8gb|--profile=8GB) PROFILE_OVERRIDE="8gb" ;;
         --profile=10gb|--profile=10GB) PROFILE_OVERRIDE="10gb" ;;
-        --p2p) ENABLE_P2P=1 ;;
+        --p2p) P2P_MODE="bar1" ;;
+        --p2p=*)
+            P2P_MODE="${arg#*=}"
+            case "${P2P_MODE}" in
+                off|bar1|mailbox) ;;
+                *)
+                    echo "Unknown --p2p value: ${arg#*=} (use off, bar1 or mailbox)" >&2
+                    exit 1
+                    ;;
+            esac
+            ;;
         --no-iommu) CONFIGURE_IOMMU=0 ;;
         --no-gen2-service) DEPRECATED_GEN2_FLAG=1 ;;
         --no-passthrough) CONFIGURE_PASSTHROUGH=0 ;;
         -h|--help)
             cat <<'EOF'
 Usage: sudo ./install.sh [--profile=8gb|10gb] [--no-iommu]
-                        [--no-passthrough] [--p2p]
+                        [--no-passthrough] [--p2p=bar1|mailbox|off]
 
   --profile=8gb   Force 8GB metadata label (geometry is still chosen per PCI ID)
   --profile=10gb  Force 10GB metadata label (geometry is still chosen per PCI ID)
-  --p2p          Enable GPU-to-GPU BAR1 P2P (off by default). Requires a large
-                  BAR1 and a host topology that carries peer traffic; see
-                  docs/P2P.md. Verify real peer transfers.
+  --p2p          Same as --p2p=bar1.
+  --p2p=bar1     GPU-to-GPU P2P through a static BAR1 that maps the whole
+                  framebuffer, with the copy engine DMAing into the peer. Needs a
+                  BAR1 at least as large as each card's framebuffer, and the card's
+                  resizable-BAR capability table stops at 64 GiB, so a card on the
+                  80 GiB layout cannot take this path.
+  --p2p=mailbox  GPU-to-GPU P2P through the NV_P2P write-mailbox aperture instead:
+                  64 KiB per peer at the bottom of BAR1 and no framebuffer mapping,
+                  which is what leaves it as the route for a card whose framebuffer
+                  is bigger than any BAR1 it can be given. Needs the PRI decode
+                  trap that the closed GSP-RM is denied for those registers to be
+                  armable; where it is not, the driver leaves P2P unsupported rather
+                  than reporting copies that move garbage. Measured at Gen2 only.
+                  See docs/P2P.md before choosing.
+  --p2p=off      No P2P overrides (the default).
+                  Whichever path: a capability report is not a transfer, so verify
+                  real peer copies as docs/P2P.md describes.
   --no-iommu      Do not touch the kernel command line (leave IOMMU settings alone)
   --no-gen2-service
                   Accepted and ignored. There is no boot-time retrain service any
@@ -236,12 +260,17 @@ depmod -a "$(uname -r)"
 ok "DKMS conflicting modules resolution complete"
 
 step "Building and installing patched modules"
-if (( ENABLE_P2P == 1 )); then
+if [[ "${P2P_MODE}" == "bar1" ]]; then
     info "Enabling GPU-to-GPU BAR1 P2P"
     warn "P2P capability reports alone do not prove transfers work."
     warn "Check BAR1 on every GPU and run the transfer test in docs/P2P.md."
+elif [[ "${P2P_MODE}" == "mailbox" ]]; then
+    info "Enabling GPU-to-GPU mailbox P2P (no large BAR1 needed)"
+    warn "This route lives or dies on one fused register: watch for the CMP-P2P"
+    warn "lines in dmesg, and check copied bytes, not just cuMemcpyPeer's return."
+    warn "tools/p2p-content-check.py is what catches a mailbox that was never armed."
 else
-    info "P2P overrides disabled (use --p2p to enable)"
+    info "P2P overrides disabled (use --p2p=bar1 or --p2p=mailbox to enable)"
 fi
 if [[ "${CMPUNLOCKER_EXPERIMENTAL_GEN4:-0}" == "1" ]]; then
     info "Asking each card for the PCIe speed its own fuses allow (cmp_pcie_gen=0)"
@@ -252,7 +281,7 @@ chmod +x "${SCRIPT_DIR}/driver/build.sh"
 CMPUNLOCKER_DRIVER_VERSION="${detected}" \
 CMPUNLOCKER_CARD_PROFILE="${CARD_PROFILE}" \
 CMPUNLOCKER_GPU_INVENTORY="${CMPUNLOCKER_GPU_INVENTORY}" \
-CMPUNLOCKER_ENABLE_P2P="${ENABLE_P2P}" \
+CMPUNLOCKER_ENABLE_P2P="${P2P_MODE}" \
 CMPUNLOCKER_EXPERIMENTAL_80G="${CMPUNLOCKER_EXPERIMENTAL_80G:-0}" \
 CMPUNLOCKER_EXPERIMENTAL_GEN4="${CMPUNLOCKER_EXPERIMENTAL_GEN4:-0}" \
     "${SCRIPT_DIR}/driver/build.sh"
@@ -462,10 +491,13 @@ banner
 echo "cmpunlocker install finished!"
 echo "Profile: ${CARD_PROFILE}  |  ${#GPU_BDFS[@]} GPU(s): ${COUNT_8GB}× 8gb, ${COUNT_10GB}× 10gb"
 echo "Passthrough: ${PASSTHROUGH_STATUS}"
-if (( ENABLE_P2P == 1 )); then
-    echo "P2P: enabled (BAR1 path; verify actual transfers using docs/P2P.md)"
-else
+if [[ "${P2P_MODE}" == "off" ]]; then
     echo "P2P: disabled"
+else
+    echo "P2P: ${P2P_MODE} (verify actual transfers using docs/P2P.md)"
+    if [[ "${P2P_MODE}" == "mailbox" ]]; then
+        echo "     dmesg | grep CMP-P2P is the difference between armed and not"
+    fi
 fi
 if [[ -n "${IOMMU_PARAMS}" && "${IOMMU_STATUS}" != "skipped" ]]; then
     echo "IOMMU:   ${IOMMU_PARAMS} (${IOMMU_STATUS})"

@@ -8,8 +8,10 @@ uninstaller.
 
 Implemented functions:
 
-- **GPU-to-GPU BAR1 P2P.** Optional, off by default, enabled with `--p2p`. Capability
-  override, resizable BAR and the BAR1 DMA path, restricted to CMP device ids.
+- **GPU-to-GPU P2P.** Optional, off by default, enabled with `--p2p=bar1` or
+  `--p2p=mailbox`. The first is the BAR1 path: capability override, resizable BAR and the
+  BAR1 DMA path, restricted to CMP device ids. The second reaches the peer through the
+  `NV_P2P` write mailbox instead, and needs no large BAR1.
 - **80 GiB memory unlock on hardware-unlocked cards.** The capacity is derived from the
   card's own partition count and partition size, not from a card table. A card that cannot
   boot the wide layout steps back one layout and records the stage. Other cards are unlocked
@@ -30,8 +32,8 @@ This tree merges the P2P implementation from
 `cmpunlocker` build. All original memory-geometry, PCIe and passthrough behaviour is
 preserved. Beyond the merge itself:
 
-- P2P is a build-time option (`--p2p`), off by default; builds without the flag do not
-  contain the P2P changes at all.
+- P2P is a build-time option (`--p2p=bar1|mailbox`), off by default; builds without the flag do not
+  contain the P2P changes at all, and a build carries one route rather than both.
 - The P2P set carries no driver-version whitelist. Three patch sites that failed on newer
   releases are anchors rather than context hunks, so a release that moves one of them fails
   the build and names the site.
@@ -89,21 +91,30 @@ Then perform a cold reboot (full power off, then boot).
 
 ### Optional GPU-to-GPU P2P
 
-This build ships the GPU-to-GPU BAR1 P2P mode ported from
-[`bayley/cmpunlocker`](https://github.com/bayley/cmpunlocker). It is off by
-default and is turned on with the `--p2p` flag:
+This build ships two GPU-to-GPU P2P routes. Both are off by default, and a build
+carries one of them, never both:
 
 ```bash
-sudo ./install.sh --p2p
+sudo ./install.sh --p2p=bar1      # same as plain --p2p
+sudo ./install.sh --p2p=mailbox
 # Can be combined with the existing options:
-sudo ./install.sh --p2p --profile=8gb --no-passthrough
+sudo ./install.sh --p2p=mailbox --profile=8gb --no-passthrough
 ```
 
-`--p2p` enables the BAR1 P2P implementation from `bayley/cmpunlocker`, including
-capability overrides, peer mappings and page-table rewrites. It is off by
-default, and it applies to every release in `driver/VERSION`. Every peer GPU needs
-a sufficiently large BAR1 and a host PCIe path that carries peer traffic (BIOS must
-provide enough Above-4G MMIO space).
+`--p2p=bar1` enables the BAR1 P2P implementation from `bayley/cmpunlocker`,
+including capability overrides, peer mappings and page-table rewrites. It applies to
+every release in `driver/VERSION`. Every peer GPU needs a sufficiently large BAR1 and
+a host PCIe path that carries peer traffic (BIOS must provide enough Above-4G MMIO
+space).
+
+`--p2p=mailbox` moves peer traffic through RM's write-mailbox aperture instead, which
+needs 64 KiB per peer and no BAR1 mapping of the framebuffer. That makes it the route
+left for a card whose framebuffer is bigger than any BAR1 its own resizable-BAR table
+offers (the 80 GiB layout tops out at a 64 GiB BAR1), and for a host that cannot
+resize BAR1 at all. It needs a PRI decode trap the closed GSP-RM is denied for those
+registers, so it depends on one fused register per card; where that mask will not
+open, the driver leaves P2P unsupported instead of reporting copies that move
+garbage. Measured at Gen2 only, and not yet verified on this machine.
 See [P2P setup and transfer verification](docs/P2P.md).
 中文说明：[P2P 合并与验证说明](docs/P2P-MERGE.zh-CN.md)。
 
@@ -122,13 +133,18 @@ See [P2P setup and transfer verification](docs/P2P.md).
 
 P2P builds install the modules and module options for the next cold boot.
 Reinstall without `--p2p` to disable the optional driver patches and settings.
-Keep `--p2p` when reinstalling after a kernel upgrade.
+Keep the same `--p2p=` choice when reinstalling after a kernel upgrade.
 
 The same switch is available for direct driver builds:
 
 ```bash
-sudo env CMPUNLOCKER_ENABLE_P2P=1 ./driver/build.sh
+sudo env CMPUNLOCKER_ENABLE_P2P=bar1   ./driver/build.sh
+sudo env CMPUNLOCKER_ENABLE_P2P=mailbox ./driver/build.sh
 ```
+
+`off`, `0` and the empty string disable it; `1` is the old spelling of `bar1`. On a
+host where the resize above is the problem rather than the card, `mailbox` is the
+route that does not need a large BAR1 at all.
 
 After a cold boot, verify real peer transfers (capability reports alone are not
 proof that data moves):
@@ -141,10 +157,15 @@ nvcc -O2 -arch=sm_80 -o /tmp/cmpunlocker-test-p2p tools/test-p2p.cu
 timeout 120s /tmp/cmpunlocker-test-p2p 0 1
 ```
 
+On a `mailbox` build, also `sudo dmesg | grep CMP-P2P` — the trap either armed on
+both cards or said why not — and check the bytes rather than the return codes with
+`python3 tools/p2p-content-check.py 0 1`, which copies over a destination that starts
+out wrong at the sizes where an unprogrammed mailbox window first shows.
+
 ### Optional GPUDirect Storage (GDS)
 
 ```bash
-sudo ./install.sh --p2p --no-iommu
+sudo ./install.sh --p2p=bar1 --no-iommu
 ```
 
 `--no-iommu` keeps the installer from adding IOMMU options to the kernel
@@ -152,7 +173,9 @@ command line: GDS performs DMA straight between the NVMe device and the GPU's
 BAR1, and leaving the IOMMU out of the storage DMA path avoids the address
 translation layer in the way.
 
-This is a GDS-specific choice. Pure P2P does not need the IOMMU disabled — it
+This is a GDS-specific choice, and so is the `bar1` here: GDS writes into the
+framebuffer through the BAR1 mapping, which is the one thing the mailbox route does
+not provide. Pure P2P does not need the IOMMU disabled — it
 runs fine under the default `iommu=on`/`iommu=pt`; if peer traffic is blocked,
 the cause is ACS on the intervening bridges, not the IOMMU itself.
 
@@ -196,8 +219,10 @@ the cause is ACS on the intervening bridges, not the IOMMU itself.
     <td>Working ✓</td>
   </tr>
   <tr>
-    <td>GPU-to-GPU BAR1 P2P</td>
-    <td>Optional: --p2p; requires host setup and real transfer verification</td>
+    <td>GPU-to-GPU P2P</td>
+    <td>Optional: --p2p=bar1 (needs a BAR1 as large as the framebuffer) or
+    --p2p=mailbox (verified on two 80 GiB cards at Gen4, ~20-25 GB/s per direction,
+    no large BAR1 needed); requires host setup and real transfer verification</td>
   </tr>
   <tr>
     <td>Persistence across reboot (patched modules)</td>
@@ -307,12 +332,16 @@ the stock release and on the patched tree:
 | Layer | Form | Cost of a new release |
 | --- | --- | --- |
 | `dynfb/cmp_dynamic.h`, the policy | copied into the tree whole | none |
-| 14 hooks | spliced at anchors | 7 of them anchor on text our own patches insert, so they cannot move; 7 (`early-geom`, `retry`, `registry`, `bar1`, and the three P2P sites) anchor on lines of the driver's own, and a release that moves one of those fails the build and names that hook. `tests/test_patches.py` checks both halves of that split against the release as shipped |
+| 15 hooks | spliced at anchors | 7 of them anchor on text our own patches insert, so they cannot move; 8 (`early-geom`, `retry`, `registry`, `bar1`, and the P2P caps and resizable-BAR sites) anchor on lines of the driver's own, and a release that moves one of those fails the build and names that hook. `tests/test_patches.py` checks both halves of that split against the release as shipped |
 | 14 base patches | context diffs | a release that moves the context rejects the patch, which fails the build and names the patch |
-| 3 P2P patches | context diffs, `--fuzz=0` | applies on every supported release, which the same test checks by applying the set to all of them |
+| 3 BAR1 P2P patches, 2 mailbox P2P patches | context diffs, `--fuzz=0` | applies on every supported release, which the same test checks by applying each set to all of them |
 
-Three of the hooks are the P2P feature's, and are placed only when `--p2p` is given;
-without it those three files are left exactly as upstream shipped them. Two of them
+Four of the hooks are the P2P feature's, and are placed only for the route that
+needs them: `--p2p=bar1` takes the caps override, the BAR1 DMA override and the
+resizable-BAR default, `--p2p=mailbox` takes a different caps override — one that
+checks the fused privilege mask before claiming support — and the resizable-BAR
+default. Without `--p2p` those files are left exactly as upstream shipped them, which
+`tests/test_patches.py` checks for all three settings. Two of them
 replace the line they change rather than adding to it, which is how a single-line
 edit survives a release that edits what sits next to it.
 Runtime behaviour is not on that list at all: the layout and the link target come

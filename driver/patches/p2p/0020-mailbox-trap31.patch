@@ -1,0 +1,207 @@
+CMP mailbox P2P: arm PRI decode trap 31 around the two
+SETUP_P2P_MAILBOX RPCs, and across the host-side write of
+NV_P2P_WREQMB_L/H that follows the remote one.  Without it the closed
+GSP-RM is denied the NV_P2P block by the CMP's PRI fuses, the RPCs lie
+with NV_OK, and a peer copy moves garbage behind a successful return.
+Applied only with --p2p=mailbox; see docs/P2P.md.
+
+--- a/src/nvidia/src/kernel/gpu/bus/arch/maxwell/kern_bus_gm200.c
++++ b/src/nvidia/src/kernel/gpu/bus/arch/maxwell/kern_bus_gm200.c
+@@ -37,6 +37,156 @@
+     ((PCIE_P2P_WRITE_MAILBOX_SIZE << DRF_SIZE(NV_P2P_WMBOX_ADDR_ADDR)) - \
+      PCIE_P2P_WRITE_MAILBOX_SIZE)
+ 
++//
++// cmpunlocker --p2p=mailbox: PRI decode trap 31 around the mailbox setup RPCs.
++//
++// Both SETUP_P2P_MAILBOX RPCs are served by the closed GSP-RM, which programs
++// the NV_P2P block (published/maxwell/gm200/dev_nv_p2p.h: 0x00139000 through
++// 0x0013AFFF) at a PRI privilege level the CMP refuses.  The RPC still returns
++// NV_OK, so the aperture is left unprogrammed and a peer copy reports success
++// while it moves garbage: NV_P2P_WREQMB_L/H carry the page each write chunk
++// targets, and never written they hold the reset value, which is what makes a
++// 32 MiB copy come back with only its first 128 KiB correct.  The same host
++// path writes those two registers through kbusWriteP2PWmbTag_HAL() below, so
++// the remote trap stays armed across that call.
++//
++// Trap 31 is aimed at the block and told to re-stamp matching accesses at a
++// level the part accepts, for the window of one RPC.  Whether it can be armed
++// at all is per part: the trap's own PRIV_LEVEL_MASK has to read 0xFFFFFFFF,
++// and where it does not this stays out of the way and the setup runs exactly
++// as the stock driver runs it.  dynfb/hooks/p2p_caps_mailbox.c is what keeps
++// the driver from claiming P2P in that case, because a mailbox that was never
++// programmed is worse than one that was never asked for.
++//
++// None of the offsets or payloads below are in a published NVIDIA header; they
++// are the values measured to work on a CMP 170HX.  Ported from the p2p-unlock
++// patch of cmpunlocker-p2p (amoghmunikote's P2P branch, commit
++// 14b38f72dbe0ee03dfd9377880a0c83302f703d3; the trap approach itself is
++// asm64-hooligan's).
++//
++#define CMP_TRAP31_MATCH_REG   0x0012247cU
++#define CMP_TRAP31_MASK_REG    0x001224fcU
++#define CMP_TRAP31_DATA1_REG   0x0012257cU
++#define CMP_TRAP31_DATA2_REG   0x001225fcU
++#define CMP_TRAP31_ACTION_REG  0x0012267cU
++#define CMP_TRAP31_CFG_REG     0x001226fcU
++#define CMP_TRAP31_PLM_REG     0x0012277cU
++
++#define CMP_TRAP31_P2P_MATCH   0x00139000U   // NV_P2P, first register
++#define CMP_TRAP31_P2P_MASK    0xfc000fffU   // compared bits: 31:26 and 11:0
++#define CMP_TRAP31_P2P_DATA1   0xc0000000U
++#define CMP_TRAP31_P2P_CFG     0x0001c010U
++#define CMP_TRAP31_SET_PRIV    0x00100000U   // ACTION: re-stamp, do not deny
++
++typedef struct
++{
++    NvU32  match;
++    NvU32  mask;
++    NvU32  data1;
++    NvU32  data2;
++    NvU32  action;
++    NvU32  cfg;
++    NvBool valid;
++} CMP_P2P_TRAP;
++
++static NvBool
++_cmpIsCmpSku_GM200
++(
++    OBJGPU *pGpu
++)
++{
++    NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
++
++    // 0x20C2 is the 8 GB SKU with the hidden FBP pair, 0x2082 the 10 GB SKU.
++    // No other part this driver reaches needs the trap, and none of them would
++    // tolerate having someone else's PRI trap rewritten under it.
++    return (devId == 0x20C2U) || (devId == 0x2082U);
++}
++
++static void
++_cmpP2PTrapRestore_GM200
++(
++    OBJGPU        *pGpu,
++    CMP_P2P_TRAP  *pState
++)
++{
++    if ((pState == NULL) || !pState->valid)
++        return;
++
++    // Stop the trap acting first, put the payload back, and restore ACTION
++    // last, so no window can open with a half-restored payload behind it.
++    GPU_REG_WR32(pGpu, CMP_TRAP31_ACTION_REG, 0);
++    GPU_REG_WR32(pGpu, CMP_TRAP31_CFG_REG,    pState->cfg);
++    GPU_REG_WR32(pGpu, CMP_TRAP31_DATA2_REG,  pState->data2);
++    GPU_REG_WR32(pGpu, CMP_TRAP31_DATA1_REG,  pState->data1);
++    GPU_REG_WR32(pGpu, CMP_TRAP31_MASK_REG,   pState->mask);
++    GPU_REG_WR32(pGpu, CMP_TRAP31_MATCH_REG,  pState->match);
++    GPU_REG_WR32(pGpu, CMP_TRAP31_ACTION_REG, pState->action);
++    pState->valid = NV_FALSE;
++}
++
++static void
++_cmpP2PTrapArm_GM200
++(
++    OBJGPU        *pGpu,
++    CMP_P2P_TRAP  *pState,
++    NvU32          peer
++)
++{
++    NvU32 plm;
++
++    pState->valid = NV_FALSE;
++
++    if (!_cmpIsCmpSku_GM200(pGpu))
++        return;
++
++    plm = GPU_REG_RD32(pGpu, CMP_TRAP31_PLM_REG);
++    if (plm != 0xFFFFFFFFU)
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "CMP-P2P GPU%u peer%u: trap31 PLM 0x%08x is not writable, "
++                  "running the mailbox setup without it\n",
++                  gpuGetInstance(pGpu), peer, plm);
++        return;
++    }
++
++    pState->match  = GPU_REG_RD32(pGpu, CMP_TRAP31_MATCH_REG);
++    pState->mask   = GPU_REG_RD32(pGpu, CMP_TRAP31_MASK_REG);
++    pState->data1  = GPU_REG_RD32(pGpu, CMP_TRAP31_DATA1_REG);
++    pState->data2  = GPU_REG_RD32(pGpu, CMP_TRAP31_DATA2_REG);
++    pState->action = GPU_REG_RD32(pGpu, CMP_TRAP31_ACTION_REG);
++    pState->cfg    = GPU_REG_RD32(pGpu, CMP_TRAP31_CFG_REG);
++    pState->valid  = NV_TRUE;
++
++    GPU_REG_WR32(pGpu, CMP_TRAP31_ACTION_REG, 0);
++    GPU_REG_WR32(pGpu, CMP_TRAP31_DATA1_REG,  CMP_TRAP31_P2P_DATA1);
++    GPU_REG_WR32(pGpu, CMP_TRAP31_DATA2_REG,  0);
++    GPU_REG_WR32(pGpu, CMP_TRAP31_CFG_REG,    CMP_TRAP31_P2P_CFG);
++    GPU_REG_WR32(pGpu, CMP_TRAP31_MATCH_REG,  CMP_TRAP31_P2P_MATCH);
++    GPU_REG_WR32(pGpu, CMP_TRAP31_MASK_REG,   CMP_TRAP31_P2P_MASK);
++    GPU_REG_WR32(pGpu, CMP_TRAP31_ACTION_REG, CMP_TRAP31_SET_PRIV);
++
++    // Reading the payload back is the only way to learn whether the write took:
++    // a PRI write the fuses reject is silent, and an armed trap that matches
++    // nothing is harmless while an unaired one that RM believes in is not.
++    if ((GPU_REG_RD32(pGpu, CMP_TRAP31_MATCH_REG)  != CMP_TRAP31_P2P_MATCH) ||
++        (GPU_REG_RD32(pGpu, CMP_TRAP31_MASK_REG)   != CMP_TRAP31_P2P_MASK)  ||
++        (GPU_REG_RD32(pGpu, CMP_TRAP31_DATA1_REG)  != CMP_TRAP31_P2P_DATA1) ||
++        (GPU_REG_RD32(pGpu, CMP_TRAP31_CFG_REG)    != CMP_TRAP31_P2P_CFG)   ||
++        (GPU_REG_RD32(pGpu, CMP_TRAP31_ACTION_REG) != CMP_TRAP31_SET_PRIV))
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "CMP-P2P GPU%u peer%u: trap31 did not take, running the "
++                  "mailbox setup without it\n", gpuGetInstance(pGpu), peer);
++        _cmpP2PTrapRestore_GM200(pGpu, pState);
++        return;
++    }
++
++    NV_PRINTF(LEVEL_ERROR,
++              "CMP-P2P GPU%u peer%u: trap31 armed on NV_P2P (PLM 0x%08x)\n",
++              gpuGetInstance(pGpu), peer, plm);
++}
++
+ /*!
+  * @brief Setup the mailboxes of 2 GPUs so that the local GPU can access remote GPU.
+  *
+@@ -71,6 +221,8 @@
+     RM_API *pRmApi1     = GPU_GET_PHYSICAL_RMAPI(pGpu1);
+     NV2080_CTRL_CMD_INTERNAL_BUS_SETUP_P2P_MAILBOX_LOCAL_PARAMS  params0 = {0};
+     NV2080_CTRL_CMD_INTERNAL_BUS_SETUP_P2P_MAILBOX_REMOTE_PARAMS params1 = {0};
++    CMP_P2P_TRAP localTrap  = {0};
++    CMP_P2P_TRAP remoteTrap  = {0};
+     NV_STATUS status;
+ 
+     NV_ASSERT_OR_RETURN_VOID(local2Remote < P2P_MAX_NUM_PEERS);
+@@ -113,6 +265,7 @@
+     NV_ASSERT((remoteWMBoxAddrU64 & 0xFFFF) == 0);
+ 
+     // Setup PCIE P2P Mailbox on local GPU
++    _cmpP2PTrapArm_GM200(pGpu0, &localTrap, local2Remote);
+     params0.local2Remote                = local2Remote;
+     params0.remote2Local                = remote2Local;
+     params0.localP2PDomainRemoteAddr    = localP2PDomainRemoteAddr;
+@@ -127,9 +280,11 @@
+                               NV2080_CTRL_CMD_INTERNAL_BUS_SETUP_P2P_MAILBOX_LOCAL,
+                               &params0,
+                               sizeof(NV2080_CTRL_CMD_INTERNAL_BUS_SETUP_P2P_MAILBOX_LOCAL_PARAMS));
++    _cmpP2PTrapRestore_GM200(pGpu0, &localTrap);
+     NV_ASSERT(status == NV_OK);
+ 
+     // Setup PCIE P2P Mailbox on remote GPU
++    _cmpP2PTrapArm_GM200(pGpu1, &remoteTrap, remote2Local);
+     params1.local2Remote                = local2Remote;
+     params1.remote2Local                = remote2Local;
+     params1.localP2PDomainRemoteAddr    = localP2PDomainRemoteAddr;
+@@ -145,7 +300,11 @@
+                               sizeof(NV2080_CTRL_CMD_INTERNAL_BUS_SETUP_P2P_MAILBOX_REMOTE_PARAMS));
+     NV_ASSERT(status == NV_OK);
+ 
++    // Restored after the tag write on purpose: kbusWriteP2PWmbTag_HAL is
++    // the host-side write of NV_P2P_WREQMB_L/H, the same block the trap
++    // exists for, and an unaired trap leaves it at its reset value.
+     kbusWriteP2PWmbTag_HAL(pGpu1, pKernelBus1, remote2Local, params0.p2pWmbTag);
++    _cmpP2PTrapRestore_GM200(pGpu1, &remoteTrap);
+ }
+ 
+ void

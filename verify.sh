@@ -171,14 +171,26 @@ echo ""
 if [[ -r "${INSTALL_MOD_DIR}/card_profile" ]]; then
     info "Installed profile: $(cat "${INSTALL_MOD_DIR}/card_profile") / geometry: $(cat "${INSTALL_MOD_DIR}/unlock_geometry" 2>/dev/null || echo '?')"
 fi
-if [[ -r "${INSTALL_MOD_DIR}/p2p_enabled" ]] &&
-   [[ "$(cat "${INSTALL_MOD_DIR}/p2p_enabled")" == "1" ]]; then
-    info "Installed modules were built with BAR1 P2P enabled"
-    info "P2P capability matrices (diagnostic only):"
-    nvidia-smi topo -p2p r || warn "Could not query P2P read capabilities"
-    nvidia-smi topo -p2p w || warn "Could not query P2P write capabilities"
-    warn "These matrices do not verify peer transfers; run the test in docs/P2P.md."
-fi
+P2P_BUILT="$(cat "${INSTALL_MOD_DIR}/p2p_enabled" 2>/dev/null || true)"
+case "${P2P_BUILT}" in
+    ''|0|off|none) ;;
+    *)
+        info "Installed modules were built with ${P2P_BUILT} P2P enabled"
+        info "P2P capability matrices (diagnostic only):"
+        nvidia-smi topo -p2p r || warn "Could not query P2P read capabilities"
+        nvidia-smi topo -p2p w || warn "Could not query P2P write capabilities"
+        if [[ "${P2P_BUILT}" == "mailbox" ]]; then
+            # On this path the caps are an override, guarded by one fused register,
+            # and a mailbox the trap failed to program reports success while it
+            # moves garbage. The matrix is therefore worth nothing here; the bytes
+            # and the two CMP-P2P lines in dmesg are what say whether it works.
+            warn "mailbox P2P: expect 'CMP-P2P ... trap31 armed on NV_P2P' in dmesg,"
+            warn "and check copied bytes, not return codes: tools/p2p-content-check.py"
+        else
+            warn "These matrices do not verify peer transfers; run the test in docs/P2P.md."
+        fi
+        ;;
+esac
 
 if (( failures > 0 )); then
     echo ""

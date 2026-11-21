@@ -30,17 +30,27 @@ profiles:
     label: "mixed"
     geometry_rewrite: false
 
-# Optional patches are applied only when their feature is selected.
+# Optional patches are applied only when their feature is selected, and P2P is
+# selected by path: bar1 maps the framebuffer into a static BAR1 and DMAs into the
+# peer through it, mailbox programs the NV_P2P write aperture instead and needs no
+# large BAR1 (docs/P2P.md).  The two lists are disjoint on purpose: RM carries one
+# PCIe P2P protocol per peer pair, so a build that asked for both would get
+# whichever one the peer pair reached first and silently refuse the other.
 optional_features:
   p2p:
-    patches:
-      - p2p/0011-p2p-bar1.patch
-      - p2p/0013-skip-mailbox-peer-preinit.patch
-      - p2p/0015-bar1p2p-readcap-override.patch
-    # No "supports" list: the set applies to every release in driver/VERSION.  The
+    bar1:
+      patches:
+        - p2p/0011-p2p-bar1.patch
+        - p2p/0013-skip-mailbox-peer-preinit.patch
+        - p2p/0015-bar1p2p-readcap-override.patch
+    mailbox:
+      patches:
+        - p2p/0020-mailbox-trap31.patch
+        - p2p/0021-mailbox-trap31-plm.patch
+    # No "supports" list: every set applies to every release in driver/VERSION.  The
     # three sites that rejected on 615.x are dynfb hooks now (dynfb/hooks/p2p_*.c),
     # which are anchored on the line being changed instead of on whatever happened to
-    # sit next to it.  tests/test_patches.py applies the set to all of them.
+    # sit next to it.  tests/test_patches.py applies both sets to all of them.
 
 passthrough:
   module: cmp_no_bus_reset
@@ -64,6 +74,18 @@ unlocks:
       feat:           { addr: "0x00823804", value: "0xffffffff" }
       feat2:          { addr: "0x00823b00", value: "0xffffffff" }
       fbpa_plm:       { addr: "0x009a0148", value: "0xffffffff" }
+
+  # The mailbox P2P path needs one mask the others do not: the privilege level of
+  # the PRI decode trap that lets the closed GSP-RM touch the NV_P2P block at all.
+  # It lives in the P2P patch set rather than in privilege_masks above because a
+  # --p2p=off or --p2p=bar1 build never asks the booter to open it.
+  mailbox_p2p_trap:
+    source: patches/p2p/0020-mailbox-trap31.patch
+    registers:
+      trap31_plm:    { addr: "0x0012277c", value: "0xffffffff" }
+      trap31_match:  { addr: "0x0012247c" }
+      trap31_action: { addr: "0x0012267c" }
+      nv_p2p_start:  { addr: "0x00139000" }
 
   compute_throughput:
     patch: sec2-postbl-plm-ss-cfg.patch

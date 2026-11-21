@@ -56,5 +56,13 @@ def _bash_array(name):
     return m.group(1).split()
 
 
-def p2p_patch_order():
-    return _bash_array("P2P_PATCH_ORDER")
+def p2p_patch_order(mode=None):
+    """The optional P2P patches: one path's list, or both when mode is None.
+
+    The two paths are kept apart because build.sh does: RM carries one PCIe P2P
+    protocol per peer pair, so no build ever applies both lists.
+    """
+    if mode is None:
+        return (_bash_array("P2P_BAR1_PATCH_ORDER")
+                + _bash_array("P2P_MAILBOX_PATCH_ORDER"))
+    return _bash_array("P2P_%s_PATCH_ORDER" % mode.upper())

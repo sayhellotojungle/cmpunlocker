@@ -149,25 +149,40 @@ class DynfbFiles(unittest.TestCase):
     def test_apply_refuses_a_tree_it_cannot_place_in(self):
         import shutil
         import tempfile
-        with tempfile.TemporaryDirectory() as tmp:
-            for rel in sorted(repo.dynfb().FILES.values()):
-                os.makedirs(os.path.join(tmp, os.path.dirname(rel)), exist_ok=True)
-                with open(os.path.join(tmp, rel), "w", newline="\n") as handle:
-                    handle.write("/* an unrelated tree */\n")
-            r = subprocess.run([sys.executable, str(DYNFB / "apply.py"),
-                                "--check", "--p2p=1", tmp], capture_output=True, text=True)
-            self.assertEqual(r.returncode, 1, r.stdout)
-            self.assertIn("did not land", r.stdout)
-            self.assertNotIn("skip", r.stdout)
-            # Every hook has to be the one that reports the miss: a hook that stays
-            # quiet in a tree it cannot place in is a hook that silently did nothing.
-            self.assertEqual(r.stdout.count("FAIL"), len(repo.dynfb().HOOKS), r.stdout)
-            # --check must not touch the tree
-            self.assertEqual(read(os.path.join(tmp, "src/nvidia/src/kernel/gpu/gsp/"
-                                               "kernel_gsp.c")),
-                             "/* an unrelated tree */\n")
-            self.assertFalse(os.path.exists(os.path.join(tmp, "src/nvidia/inc")))
-            shutil.rmtree(tmp, ignore_errors=True)
+        dynfb = repo.dynfb()
+        for mode in dynfb.P2P_MODES:
+            with tempfile.TemporaryDirectory() as tmp:
+                for rel in sorted(dynfb.FILES.values()):
+                    os.makedirs(os.path.join(tmp, os.path.dirname(rel)), exist_ok=True)
+                    with open(os.path.join(tmp, rel), "w", newline="\n") as handle:
+                        handle.write("/* an unrelated tree */\n")
+                r = subprocess.run([sys.executable, str(DYNFB / "apply.py"),
+                                    "--check", "--p2p=" + mode, tmp],
+                                   capture_output=True, text=True)
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertIn("did not land", r.stdout)
+                self.assertNotIn("skip", r.stdout)
+                # Every hook that this mode asks for has to be the one that reports
+                # the miss: a hook that stays quiet in a tree it cannot place in is a
+                # hook that silently did nothing.  The other modes' hooks report
+                # themselves off, which is the only honest thing they can do.
+                asked = [name for name, key, _, _, _ in dynfb.HOOKS
+                         if name not in dynfb.OPTIONAL
+                         or mode in dynfb.OPTIONAL[name]]
+                off = [name for name, key, _, _, _ in dynfb.HOOKS
+                       if name in dynfb.OPTIONAL and mode not in dynfb.OPTIONAL[name]]
+                self.assertEqual(r.stdout.count("FAIL"), len(asked), r.stdout)
+                self.assertEqual(r.stdout.count("FAIL"), len(dynfb.HOOKS) - len(off),
+                                 "%s: a hook neither placed nor reported" % mode)
+                for name in off:
+                    self.assertIn("%-15s off " % name, r.stdout,
+                                  "%s in %s" % (mode, name))
+                # --check must not touch the tree
+                self.assertEqual(read(os.path.join(tmp, "src/nvidia/src/kernel/gpu/gsp/"
+                                                   "kernel_gsp.c")),
+                                 "/* an unrelated tree */\n")
+                self.assertFalse(os.path.exists(os.path.join(tmp, "src/nvidia/inc")))
+                shutil.rmtree(tmp, ignore_errors=True)
 
     def test_build_script_wires_dynfb_in_before_the_profile_rewrite(self):
         script = (repo.ROOT / "driver" / "build.sh").read_text()

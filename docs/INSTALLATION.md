@@ -35,15 +35,20 @@ Then perform a cold reboot (full power off, then boot).
 ## Optional P2P
 
 ```bash
-sudo ./install.sh --p2p
+sudo ./install.sh --p2p=bar1        # same as --p2p
+sudo ./install.sh --p2p=mailbox
 ```
 
 This can be combined with the existing profile, IOMMU, Gen2-service and
-passthrough options. Set up the host's large BAR1 first; see
-[P2P setup and real-transfer verification](P2P.md).
+passthrough options. `--p2p=bar1` is the route that needs the host's large BAR1 set up
+first; `--p2p=mailbox` needs no large BAR1 but depends on one fused register per card
+and has not been verified on this machine. Both are described, with how to tell them
+apart, in [P2P setup and real-transfer verification](P2P.md).
 
 P2P is off by default. Reinstall without `--p2p` to disable it and cold boot.
-Re-run with `--p2p` after a kernel upgrade to retain it.
+Re-run with the same `--p2p=` choice after a kernel upgrade to retain it. Switching
+between the two routes is a rebuild, not a reconfiguration: the driver carries one
+PCIe P2P protocol per peer pair.
 
 ## Uninstall
 

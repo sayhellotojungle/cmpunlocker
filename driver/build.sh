@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mapfile -t SUPPORTED_VERSIONS < <(grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' "${SCRIPT_DIR}/VERSION")
 DEFAULT_VERSION="${SUPPORTED_VERSIONS[0]:-}"
 VERSION="${CMPUNLOCKER_DRIVER_VERSION:-${DEFAULT_VERSION}}"
-ENABLE_P2P="${CMPUNLOCKER_ENABLE_P2P:-0}"
+ENABLE_P2P="${CMPUNLOCKER_ENABLE_P2P:-off}"
 ENABLE_80G="${CMPUNLOCKER_EXPERIMENTAL_80G:-0}"
 ENABLE_GEN4="${CMPUNLOCKER_EXPERIMENTAL_GEN4:-0}"
 PATCH_DIR="${SCRIPT_DIR}/patches"
@@ -40,9 +40,15 @@ version_supported() {
     return 1
 }
 
+# P2P is a path, not a switch.  off and 1 keep their old meaning (1 is what
+# --p2p has always selected); mailbox is the second route, documented in
+# docs/P2P.md.  The variable is still the one install.sh exports, so nothing that
+# ever ran this script has to change the way it asks for a build.
 case "${ENABLE_P2P}" in
-    0|1) ;;
-    *) die "CMPUNLOCKER_ENABLE_P2P must be 0 or 1 (got: '${ENABLE_P2P}')" ;;
+    0|off|none|'') P2P_MODE="off" ;;
+    1|bar1)        P2P_MODE="bar1" ;;
+    mailbox)       P2P_MODE="mailbox" ;;
+    *) die "CMPUNLOCKER_ENABLE_P2P must be off, bar1 or mailbox (got: '${ENABLE_P2P}')" ;;
 esac
 case "${ENABLE_80G}" in
     0|1) ;;
@@ -56,6 +62,22 @@ case "${BUILD_ONLY}" in
     0|1) ;;
     *) die "CMPUNLOCKER_BUILD_ONLY must be 0 or 1" ;;
 esac
+
+# Is any P2P in play, in this build or in the one already installed here?  Both
+# routes rewrite per-peer state that a live module reload cannot be trusted to
+# unwind, so either one turns the end of this script into "install and stop".
+# p2p_enabled held 0 or 1 before --p2p grew a second path, which is why the test
+# is "not one of the ways to say off" rather than a comparison against a list.
+p2p_needs_cold_boot() {
+    local value
+    for value in "${P2P_MODE}" "${PREVIOUS_P2P}"; do
+        case "${value}" in
+            ''|0|off|none) ;;
+            *) return 0 ;;
+        esac
+    done
+    return 1
+}
 
 [[ "${EUID}" -eq 0 ]] || die "Run as root: sudo ${SCRIPT_DIR}/build.sh"
 [[ -n "${VERSION}" ]] || die "No driver version set (driver/VERSION empty and CMPUNLOCKER_DRIVER_VERSION unset)"
@@ -83,14 +105,42 @@ PATCH_ORDER=(
     ecc-fbpa-static.patch
     ecc-reporting.patch
 )
-P2P_PATCH_ORDER=(
+# The two P2P routes share no patch, and they must not share one: RM carries a
+# single PCIe P2P protocol between two GPUs at a time (gate 4 of
+# kbusIsPcieBar1P2PMappingSupported_GH100 refuses the BAR1 route over a peer
+# number the mailbox route already took), so a build that carried both patches
+# would not get both paths — it would get whichever one the peer pair reached
+# first, with the other silently refused.  bar1 is the CE-DMA path into a BAR1
+# that maps the whole framebuffer; mailbox programs the NV_P2P aperture instead,
+# which needs 64 KiB per peer and nothing else, and it is the only route left on
+# a card whose framebuffer outgrows the 64 GiB ceiling the resizable-BAR
+# capability table offers (docs/P2P.md).
+P2P_BAR1_PATCH_ORDER=(
     p2p/0011-p2p-bar1.patch
     p2p/0013-skip-mailbox-peer-preinit.patch
     p2p/0015-bar1p2p-readcap-override.patch
 )
-# The P2P set has no version gate: every hunk of it, and the three dynfb hooks the
-# feature adds, places on every release in driver/VERSION.  tests/test_patches.py
-# applies the whole set against all of them with --fuzz=0, which is what keeps this
+P2P_MAILBOX_PATCH_ORDER=(
+    p2p/0020-mailbox-trap31.patch
+    p2p/0021-mailbox-trap31-plm.patch
+)
+P2P_PATCH_ORDER=()
+case "${P2P_MODE}" in
+    bar1)
+        P2P_PATCH_ORDER=("${P2P_BAR1_PATCH_ORDER[@]}")
+        info "GPU-to-GPU BAR1 P2P enabled"
+        ;;
+    mailbox)
+        P2P_PATCH_ORDER=("${P2P_MAILBOX_PATCH_ORDER[@]}")
+        info "GPU-to-GPU mailbox P2P enabled (needs no large BAR1; verify real transfers)"
+        ;;
+    *)
+        info "GPU-to-GPU P2P overrides disabled"
+        ;;
+esac
+# The P2P sets have no version gate: every hunk of them, and the dynfb hooks the
+# features add, places on every release in driver/VERSION.  tests/test_patches.py
+# applies both sets against all of them with --fuzz=0, which is what keeps this
 # claim honest across a branch bump.
 #
 # Three sites used to reject on 615.x and are dynfb hooks now, because a context diff
@@ -101,11 +151,8 @@ P2P_PATCH_ORDER=(
 # hunk carried.  None of that was a P2P change; the hunks only asked for context they
 # had no right to.  A branch that really does move one of these sites is now a build
 # error naming the hook, rather than a release nobody is allowed to build P2P on.
-if [[ "${ENABLE_P2P}" -eq 1 ]]; then
+if [[ ${#P2P_PATCH_ORDER[@]} -gt 0 ]]; then
     PATCH_ORDER+=("${P2P_PATCH_ORDER[@]}")
-    info "GPU-to-GPU BAR1 P2P enabled"
-else
-    info "GPU-to-GPU P2P overrides disabled"
 fi
 PATCH_FILES=()
 for name in "${PATCH_ORDER[@]}"; do
@@ -138,7 +185,7 @@ CONSTANTS="${SCRIPT_DIR}/../common/constants.yaml"
 CONSTANTS_ENV="$(python3 "${SCRIPT_DIR}/../tools/read-constants.py" "${CONSTANTS}" "${PATCH_DIR}" "${SCRIPT_DIR}/build.sh" "${PROFILE}")" || die "common/constants.yaml rejected (see error above)"
 eval "${CONSTANTS_ENV}"
 
-BUILD_STAMP="${VERSION}:${KVER}:${PROFILE}:p2p=${ENABLE_P2P}:experimental80g=${ENABLE_80G}:${PATCH_HASH}:$(sha256sum "${SCRIPT_DIR}/build.sh" | cut -d' ' -f1)"
+BUILD_STAMP="${VERSION}:${KVER}:${PROFILE}:p2p=${P2P_MODE}:experimental80g=${ENABLE_80G}:${PATCH_HASH}:$(sha256sum "${SCRIPT_DIR}/build.sh" | cut -d' ' -f1)"
 
 mkdir -p "${BUILD_ROOT}"
 
@@ -185,7 +232,7 @@ else
     # dynfb/apply.py copies its header into the tree and checks every hook
     # landed, so a driver release that moved the code costs a line number, not a
     # silently misplaced hunk.
-    python3 "${DYNFB_DIR}/apply.py" "--p2p=${ENABLE_P2P}" "${SRC_DIR}" ||
+    python3 "${DYNFB_DIR}/apply.py" "--p2p=${P2P_MODE}" "${SRC_DIR}" ||
         die "dynfb hooks did not land"
     DYNFB_H="${SRC_DIR}/${DYNFB_HEADER_DST}"
 
@@ -366,15 +413,32 @@ if [[ "${ENABLE_80G}" -eq 1 ]]; then
     # experiment can be turned off from this file alone, no rebuild needed.
     REGISTRY_DWORDS+=";CMPEnable80G=1"
 fi
-if [[ "${ENABLE_P2P}" -eq 1 ]]; then
-    REGISTRY_DWORDS+=";RMForceStaticBar1=1;RMPcieP2PType=1"
-fi
+case "${P2P_MODE}" in
+    bar1)
+        # The BAR1 route is RM's own: static BAR1 covering the whole framebuffer,
+        # and the CE DMAing into the peer through it.  Both keys have to be there,
+        # and the framebuffer has to fit — see docs/P2P.md.
+        REGISTRY_DWORDS+=";RMForceStaticBar1=1;RMPcieP2PType=1"
+        ;;
+    mailbox)
+        # The mailbox route is the opposite choice, so it sets the opposite things:
+        # RMPcieP2PType stays at its default (MAILBOX) and static BAR1 stays off,
+        # because the aperture this path writes needs 64 KiB per peer at the bottom
+        # of BAR1 and no mapping of the framebuffer at all.  CMPEnableP2PMailbox is
+        # ours: it is what p2p/0021 opens the PRI trap's privilege mask for and what
+        # dynfb/hooks/p2p_caps_mailbox.c claims caps for, so removing it from this
+        # line turns the whole feature off without a rebuild.  ForceP2P is
+        # deliberately not here — RM's own override would report the caps OK past
+        # the guard that knows better on a card whose trap cannot be armed.
+        REGISTRY_DWORDS+=";CMPEnableP2PMailbox=1"
+        ;;
+esac
 mkdir -p /etc/modprobe.d
 printf 'options nvidia %sNVreg_EnableResizableBar=1 NVreg_RegistryDwords="%s"\n' \
     "${MODULE_PARAMS}" "${REGISTRY_DWORDS}" \
     > /etc/modprobe.d/cmp-pcie-gen2.conf
-printf '%s\n' "${ENABLE_P2P}" > "${INSTALL_MOD_DIR}/p2p_enabled"
-ok "Configured Gen2/P2P module options (P2P=${ENABLE_P2P}, Gen4=${ENABLE_GEN4})"
+printf '%s\n' "${P2P_MODE}" > "${INSTALL_MOD_DIR}/p2p_enabled"
+ok "Configured Gen2/P2P module options (P2P=${P2P_MODE}, Gen4=${ENABLE_GEN4})"
 
 depmod -a "${KVER}"
 ok "depmod complete"
@@ -402,12 +466,12 @@ rebuild_initramfs() {
 }
 
 if ! rebuild_initramfs; then
-    if [[ "${ENABLE_P2P}" -eq 1 || "${PREVIOUS_P2P}" == "1" ]]; then
+    if p2p_needs_cold_boot; then
         die "Modules and settings installed, but initramfs was not rebuilt. Fix initramfs generation and rerun this build before cold rebooting."
     fi
     warn "Modules installed; rebuild initramfs manually before rebooting."
 fi
-if [[ "${ENABLE_P2P}" -eq 1 || "${PREVIOUS_P2P}" == "1" ]]; then
+if p2p_needs_cold_boot; then
     ok "Modules and P2P settings installed for the next boot"
     info "P2P builds require a cold reboot; skipping live NVIDIA module reload."
     exit 0

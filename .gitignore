@@ -38,4 +38,5 @@ credentials.json
 *.backup
 driver/.build/
 logs/
+.p2p-test-*/
 *.tar.gz

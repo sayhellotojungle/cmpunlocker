@@ -16,11 +16,15 @@ enclosing function.  Two payloads replace their anchor instead of being spliced 
 it: single-line edits whose neighbouring line is somebody else's to change, which is
 exactly what a context diff cannot survive (see REPLACES below).
 
-Three hooks belong to an optional feature and are placed only when build.sh says the
-feature is on, so a tree built without --p2p is byte-for-byte the tree from before
-P2P.
+Four hooks belong to an optional feature and are placed only when build.sh says
+which flavour of it the build is, so a tree built without --p2p is byte-for-byte
+the tree from before P2P. --p2p takes a path, not a switch: `bar1` is the CE-DMA
+path that needs a BAR1 at least as large as the framebuffer, `mailbox` is the
+NV_P2P aperture path that needs almost none, and the two differ in the caps
+override they install, which is why they are two hooks and not one with a
+condition in it.
 
-  apply.py [--check] [--p2p=0|1] <tree>    report / rewrite the tree
+  apply.py [--check] [--p2p=off|bar1|mailbox] <tree>    report / rewrite the tree
 
 Run from driver/build.sh after the patch set, before the profile rewrite.
 """
@@ -134,6 +138,15 @@ HOOKS = [
      "    pGpu->pcieP2PWriteCaps = p2pCapsParams.p2pWriteCapsStatus;\n", "",
      "hooks/p2p_caps.c"),
 
+    # Same anchor as p2p-caps, other path, and only ever one of the two: the
+    # mailbox variant withholds the caps on a card whose PRI trap cannot be
+    # armed, because a mailbox nobody programmed moves garbage behind a
+    # successful copy, and a forced cap there turns "not supported" into that.
+    ("p2p-caps-mailbox", "gpu",
+     "    pGpu->pcieP2PReadCaps = p2pCapsParams.p2pReadCapsStatus;\n"
+     "    pGpu->pcieP2PWriteCaps = p2pCapsParams.p2pWriteCapsStatus;\n", "",
+     "hooks/p2p_caps_mailbox.c"),
+
     ("p2p-resizable-bar", "nvreg",
      "NV_DEFINE_REG_ENTRY_GLOBAL(__NV_ENABLE_RESIZABLE_BAR, 0);\n", "",
      "hooks/p2p_resizable_bar.c"),
@@ -146,14 +159,24 @@ HOOKS = [
      "", "hooks/p2p_bar1dma.c"),
 ]
 
-# Hooks that belong to an optional feature: build.sh names the features it enabled,
-# and a hook whose feature is off is not placed at all, which is how a build without
-# --p2p stays exactly as it was before P2P existed.
+# Hooks that belong to an optional feature: build.sh names the path it enabled, and
+# a hook whose path was not chosen is not placed at all, which is how a build
+# without --p2p stays exactly as it was before P2P existed.  The value is the set of
+# --p2p modes that place the hook; p2p-resizable-bar is in both because a wider BAR1
+# is what the modprobe config asks for either way, and leaving it out of one of the
+# two would make the two builds differ by more than the P2P path.
 OPTIONAL = {
-    "p2p-caps": "p2p",
-    "p2p-resizable-bar": "p2p",
-    "p2p-bar1dma": "p2p",
+    "p2p-caps": ("bar1",),
+    "p2p-caps-mailbox": ("mailbox",),
+    "p2p-resizable-bar": ("bar1", "mailbox"),
+    "p2p-bar1dma": ("bar1",),
 }
+
+# --p2p is a path, not a switch, but it started life as one: build.sh and the
+# scripts that call it have spoken 0 and 1 since the feature landed.
+P2P_ALIASES = {"": "off", "0": "off", "off": "off", "none": "off",
+               "1": "bar1", "bar1": "bar1", "mailbox": "mailbox"}
+P2P_MODES = ("off", "bar1", "mailbox")
 
 # Hooks whose payload replaces the anchor instead of being spliced in front of the
 # text after it.  Their payloads are written to be unique in their file, so a re-run
@@ -177,25 +200,38 @@ def main(argv):
         print(HEADER_DST)
         return 0
     check = "--check" in argv
-    # --p2p=1 turns on the optional hooks; anything they gate is left alone, so a
-    # tree built without --p2p is the tree the driver shipped as of before P2P.
+    # --p2p picks which P2P path the build is, which is what the four optional hooks
+    # below key off.  Anything it does not name is left alone, so a tree built without
+    # --p2p is the tree the driver shipped as of before P2P.
     features = {}
     for arg in argv:
         if arg.startswith("--") and "=" in arg:
-            features[arg[2:].split("=", 1)[0]] = arg.split("=", 1)[1] == "1"
+            name, value = arg[2:].split("=", 1)
+            if name == "p2p":
+                value = P2P_ALIASES.get(value)
+                if value is None:
+                    print("dynfb: --p2p=%s is not one of %s"
+                          % (arg.split("=", 1)[1], ", ".join(P2P_MODES)))
+                    return 2
+            features[name] = value
     args = [arg for arg in argv if not arg.startswith("--")]
     if len(args) != 1:
-        print("usage: apply.py [--check] [--p2p=0|1] <driver-tree>")
+        print("usage: apply.py [--check] [--p2p=off|bar1|mailbox] <driver-tree>")
         return 2
     root = args[0].rstrip("/\\")
     texts = {}
     failed = 0
     placed = 0
+    # Two hooks on one anchor is a configuration error, not a double splice: the
+    # pair that forces the PCIe P2P caps differs only in what it believes about the
+    # card, and both of them in the same function would mean the build answers to
+    # whichever of the two paths the operator did not pick.
+    taken = {}
 
     for name, key, before, after, payload_name in HOOKS:
-        feature = OPTIONAL.get(name)
-        if feature is not None and not features.get(feature, False):
-            print("%-15s off  %s (--%s not given)" % (name, FILES[key], feature))
+        modes = OPTIONAL.get(name)
+        if modes is not None and features.get("p2p", "off") not in modes:
+            print("%-15s off  %s (--p2p=%s)" % (name, FILES[key], "|".join(modes)))
             continue
         rel = FILES[key]
         if rel not in texts:
@@ -212,6 +248,12 @@ def main(argv):
             print("%-15s FAIL  anchor matched %d times in %s" % (name, hits, rel))
             failed += 1
             continue
+        if taken.get((rel, anchor), name) != name:
+            print("%-15s FAIL  %s and %s both want the same place in %s"
+                  % (name, taken[(rel, anchor)], name, rel))
+            failed += 1
+            continue
+        taken[(rel, anchor)] = name
         index = text.index(anchor)
         if name in REPLACES:
             # The anchor is the line being changed, so it goes away with the splice.
