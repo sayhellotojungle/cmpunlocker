@@ -24,10 +24,11 @@ Only libcuda is needed -- no CUDA toolkit, no cuda-python:
     python3 tools/p2p-content-check.py [gpu_id gpu_id ...]   # default: all GPUs
     python3 tools/p2p-content-check.py --bw [--size=256m] [--seconds=5] 0 1
 
-The content pass is what decides whether P2P works. `--bw` is a separate question
+The content pass is what decides whether P2P works.  `--bw` is a separate question
 asked of the same two buffers: one sustained copy per direction, timed, reported as
-the best of the samples. On the mailbox route that number is the cost of the route,
-and the only figure published for it is a Gen2 link.
+the best of the samples -- and then that size copied once more against a destination
+that starts out wrong, so the rate is only ever printed for bytes that arrived.  The
+measured table in docs/P2P.md comes from this mode.
 """
 import ctypes as ct
 import os

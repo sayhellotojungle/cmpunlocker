@@ -41,9 +41,10 @@ sudo ./install.sh --p2p=mailbox
 
 This can be combined with the existing profile, IOMMU, Gen2-service and
 passthrough options. `--p2p=bar1` is the route that needs the host's large BAR1 set up
-first; `--p2p=mailbox` needs no large BAR1 but depends on one fused register per card
-and has not been verified on this machine. Both are described, with how to tell them
-apart, in [P2P setup and real-transfer verification](P2P.md).
+first; `--p2p=mailbox` needs no large BAR1 but depends on one fused register per card,
+and is the route that was verified on this machine's two 80 GiB cards, at Gen4 x16.
+Both are described, with how to tell them apart, in
+[P2P setup and real-transfer verification](P2P.md).
 
 P2P is off by default. Reinstall without `--p2p` to disable it and cold boot.
 Re-run with the same `--p2p=` choice after a kernel upgrade to retain it. Switching

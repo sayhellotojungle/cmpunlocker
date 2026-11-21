@@ -2,16 +2,19 @@
 
 This project unlocks NVIDIA CMP 170HX / A16 memory beyond the capacity the SKU reports,
 brings the PCIe link up to Gen4 on hardware-unlocked cards, and optionally enables
-GPU-to-GPU BAR1 P2P. It is delivered as a set of patches applied to a stock
-`open-gpu-kernel-modules` release, with an installer, a verification script and an
-uninstaller.
+GPU-to-GPU P2P over BAR1 or over RM's write mailbox. It is delivered as a set of patches
+applied to a stock `open-gpu-kernel-modules` release, with an installer, a verification
+script and an uninstaller.
 
 Implemented functions:
 
 - **GPU-to-GPU P2P.** Optional, off by default, enabled with `--p2p=bar1` or
   `--p2p=mailbox`. The first is the BAR1 path: capability override, resizable BAR and the
-  BAR1 DMA path, restricted to CMP device ids. The second reaches the peer through the
-  `NV_P2P` write mailbox instead, and needs no large BAR1.
+  BAR1 DMA path, restricted to CMP device ids, and it needs a BAR1 as large as the
+  framebuffer it maps. The second reaches the peer through the `NV_P2P` write mailbox
+  instead, 64 KiB per peer and no framebuffer mapping, so it is the route left to a card
+  whose framebuffer outgrows every BAR1 it can be given — and on this hardware it is the
+  faster of the two where the card cannot take a large BAR1, at the Gen4 link rate.
 - **80 GiB memory unlock on hardware-unlocked cards.** The capacity is derived from the
   card's own partition count and partition size, not from a card table. A card that cannot
   boot the wide layout steps back one layout and records the stage. Other cards are unlocked
@@ -34,6 +37,11 @@ preserved. Beyond the merge itself:
 
 - P2P is a build-time option (`--p2p=bar1|mailbox`), off by default; builds without the flag do not
   contain the P2P changes at all, and a build carries one route rather than both.
+- The mailbox route is not the fork's version of it. The fork reported capability support
+  unconditionally, which on a card whose PRI trap cannot be armed meant P2P "worked" and
+  moved garbage; here the override reads back the trap's privilege mask first and leaves
+  the card unsupported unless it really is open, and the mask is opened through the SEC2
+  post-BL replay, the only context that can write it.
 - The P2P set carries no driver-version whitelist. Three patch sites that failed on newer
   releases are anchors rather than context hunks, so a release that moves one of them fails
   the build and names the site.
@@ -45,6 +53,11 @@ preserved. Beyond the merge itself:
 - Forced static BAR1 is downgraded to AUTO where the framebuffer exceeds the BAR1 the card
   provides, so an 80 GiB card boots and reports itself as a non-P2P card instead of failing
   the registry check.
+- The 64 GiB ceiling on BAR1 is measured rather than assumed, on both registers behind it
+  (`tools/cmpcap.c`): the card's size table takes no write through config space or through
+  BAR0's MMIO mirror, and the selected-size field answers anything past 64 GiB with the
+  256 MiB the card has at power on. So an 80 GiB card does P2P over the mailbox, not over
+  a larger BAR1.
 - Size checks were added to the GSP postbl signature refill: a signature shorter than the
   payload it fills returns an initialisation error instead of writing past the buffer into
   host memory.
@@ -114,7 +127,10 @@ offers (the 80 GiB layout tops out at a 64 GiB BAR1), and for a host that cannot
 resize BAR1 at all. It needs a PRI decode trap the closed GSP-RM is denied for those
 registers, so it depends on one fused register per card; where that mask will not
 open, the driver leaves P2P unsupported instead of reporting copies that move
-garbage. Measured at Gen2 only, and not yet verified on this machine.
+garbage. It has been run on this machine, on two 80 GiB cards at Gen4 x16: the trap
+armed on both, all twenty content checks passed in both directions, and sustained
+copies measured 20 to 25 GB/s per direction, which is the link rather than the
+mailbox — the 6.65 GB/s the source branch publishes for this path was a Gen2 link.
 See [P2P setup and transfer verification](docs/P2P.md).
 中文说明：[P2P 合并与验证说明](docs/P2P-MERGE.zh-CN.md)。
 
@@ -160,7 +176,9 @@ timeout 120s /tmp/cmpunlocker-test-p2p 0 1
 On a `mailbox` build, also `sudo dmesg | grep CMP-P2P` — the trap either armed on
 both cards or said why not — and check the bytes rather than the return codes with
 `python3 tools/p2p-content-check.py 0 1`, which copies over a destination that starts
-out wrong at the sizes where an unprogrammed mailbox window first shows.
+out wrong at the sizes where an unprogrammed mailbox window first shows. That tool has
+a `--bw` mode for throughput; it checks the bytes of the copy it times, since on this
+route a window that stopped moving still returns success.
 
 ### Optional GPUDirect Storage (GDS)
 
@@ -267,12 +285,17 @@ card itself, so any slot works and cards can be mixed freely.
   framebuffer would fail the registry check, so on a card taking the wide layout the key is
   treated as AUTO on both sides (kernel RM and the registry table handed to GSP-RM), and
   the card boots without static BAR1 and therefore without BAR1 P2P, as a real A100 80 GB
-  does. Cards on the 64 GiB layout keep static BAR1 and P2P. The host is not the limit: the
-  region reserved above each card is 128 GiB, because BAR1 (64 GiB) plus BAR3 (32 MiB)
-  exceeds 64 GiB and is aligned to the next power of two. Having 80 GiB of memory and BAR1
-  P2P on the same card requires a 128 GiB BAR1, which requires a card BIOS whose
-  resizable-BAR table includes that size. Measured values are in
-  [docs/P2P.md](docs/P2P.md).
+  does. Cards on the 64 GiB layout keep static BAR1, and with it the BAR1 route. The host
+  is not the limit: the region reserved above each card is 128 GiB, because BAR1 (64 GiB)
+  plus BAR3 (32 MiB) exceeds 64 GiB and is aligned to the next power of two. Having 80 GiB
+  of memory and BAR1 P2P on the same card requires a 128 GiB BAR1, and no host-side change
+  gets one: a resizable-BAR capability keeps two registers and both were probed
+  (`tools/cmpcap.c`). The size table is read-only through config space and through BAR0's
+  MMIO mirror; the selected-size field, which is what actually programs the aperture and
+  which `pci_rebar_set_size()` will not write outside the table, does take writes — 64 MiB
+  and 1 GiB are accepted and decoded — but answers 128 GiB and 1 TiB with the 256 MiB the
+  card has at power on. So the limit is the card's, and an 80 GiB card reaches its peers
+  over `--p2p=mailbox` instead. Measurements are in [docs/P2P.md](docs/P2P.md).
 - **Self-healing.** Only a booter timeout counts as "this layout does not boot":
   the driver then steps one layout back (80 GiB -> 64 GiB -> the card's own fuse
   layout), asks for the boot to be replayed, and records the stage in the
