@@ -308,44 +308,81 @@ its host, not verification of this merged tree on another machine.
 ## GPUDirect Storage
 
 Both routes above move bytes between GPUs. GDS is a third route over the same aperture,
-NVMe to framebuffer, and it carries two requirements of its own. Neither is something
-this project can supply, which is why the bench now runs without GDS.
+NVMe to framebuffer. It has requirements of its own that this project does not supply,
+which is why the bench now runs without GDS, but they are not the same on the two routes
+cufile can take, and only one of them is a geometry problem.
 
-- **GPU side: a static BAR1 covering the framebuffer.** cufile's `use_pci_p2pdma` route
-  needs the GPU to publish a p2pdma resource. In the 610.57.04 sources the only
-  publisher is `kernel-open/nvidia-uvm/uvm_devmem.c`, and it publishes from the static
-  BAR1 mapping, returning before that when the GPU has no such window; cufile then
-  reports `checkIfAllGPUsSupportP2PDMA(): 0`, which is what it says today on the bench.
-  Forced static BAR1 is what creates the window, and it requires BAR1 to cover the
-  framebuffer, so GDS is a property of the 64 GiB layout. There is no third setting to
-  argue with: `nvrm_registry.h` gives `RMForceStaticBar1` DISABLE, ENABLE and AUTO,
-  where ENABLE fails the init outright when BAR1 is smaller than the framebuffer and
-  AUTO steps aside on its own. A card on the 80 GiB layout has no GDS route at any
-  setting of that key; see "BAR1 size and the 80 GiB layout".
-- **Storage side: a driver that registers with nvidia-fs.** Registration goes from the
-  filesystem or block driver to `nvidia-fs` during that driver's own module init, so
-  rebinding the device or reloading `nvidia-fs` cannot add a driver that never
-  registered. The `nvme.ko` and `nvme_core.ko` shipped with the bench kernel carry no
-  `nvfsops` references at all, and the registry lists a single provider:
+### The storage side, which blocks both routes
 
-  ```text
-  $ cat /proc/driver/nvidia-fs/modules
-  wekafsio: 1
+Something must register with `nvidia-fs`, and registration goes from the filesystem or
+block driver to `nvidia-fs` during that driver's own module init. Rebinding the device or
+reloading `nvidia-fs` cannot add a driver that never registered. The `nvme.ko` and
+`nvme_core.ko` shipped with the bench kernel carry no `nvfsops` references at all, and the
+registry lists a single provider:
+
+```text
+$ cat /proc/driver/nvidia-fs/modules
+wekafsio: 1
+```
+
+Every file on that machine's NVMe is therefore served by cufile's POSIX fallback, and
+`gdscheck -p` reports `NVMe : compat`. Changing it means installing a driver built with
+the GDS hooks (DOCA-Host, or MLNX_OFED with GDS enabled), not editing a configuration
+file. On the bench that is also an initramfs-level change to the driver that owns the
+namespace holding the model files, so it carries a boot-recovery cost of its own.
+
+### The GPU side, where the two routes differ
+
+- **Native `pci_p2pdma`: blocked by the framebuffer size.** cufile's `use_pci_p2pdma`
+  route needs the GPU to publish a p2pdma resource, and in the 610.57.04 sources the only
+  publisher is `kernel-open/nvidia-uvm/uvm_devmem.c`, which publishes the whole static BAR1
+  window and returns first when there is none: `if (!parent_gpu->static_bar1_size ||
+  parent_gpu->static_bar1_write_combined) return;` (`uvm_devmem.c:627`). Creating that
+  window requires BAR1 to cover the framebuffer, so on cards whose resizable-BAR table
+  stops at 64 GiB this route belongs to the 64 GiB layout. `RMForceStaticBar1` offers
+  DISABLE, ENABLE and AUTO and no setting changes the arithmetic; see "BAR1 size and the
+  80 GiB layout". Measured, not inferred: cufile reports
+  `checkIfAllGPUsSupportP2PDMA(): 0` on the bench today.
+- **Native `pci_p2pdma`: all-or-nothing over the GPU set.** That same check is a
+  conjunction over every GPU cufile may use, so a mixed box cannot take this route for
+  its smaller card. Observed on 2026-11-23 with cards `05:00.0` and `06:00.0` on the
+  80 GiB layout and `09:00.0` on the 64 GiB layout: `kernel Support: 1`,
+  `pci_p2pdma_supported_cuda: 1`, and `checkIfAllGPUsSupportP2PDMA(): 0`.
+- **dmabuf/legacy `nvidia-fs`: the destination buffer needs the aperture, not the whole
+  framebuffer.** Here RM decides per export, in `RmDmabufGetClientAndDevice`:
+
+  ```c
+  *pbStaticPhysAddrs = ((pGpu->getProperty(pGpu, PDB_PROP_GPU_COHERENT_CPU_MAPPING) ||
+                         pGpu->pGpuArch->bGpuArchIsZeroFb) &&
+                        (mappingType == NV_DMABUF_EXPORT_MAPPING_TYPE_DEFAULT)) ||
+                        kbusIsStaticBar1Enabled(pGpu, GPU_GET_KERNEL_BUS(pGpu));
   ```
 
-  Every file on that machine's NVMe is therefore served by cufile's POSIX fallback, and
-  `gdscheck -p` reports `NVMe : compat`. Changing that means installing a patched
-  driver (DOCA-Host, or MLNX_OFED with GDS enabled), not editing a configuration file.
+  With no static window it takes the other branch (`osapi.c`), calls
+  `kbusMapFbAperture_HAL(..., BUS_MAP_FB_FLAGS_MAP_UNICAST | BUS_MAP_FB_FLAGS_ALLOW_DISCONTIG, ...)`
+  for that buffer and offsets the ranges by `kbusGetGpuFbPhysAddressForRdma`; the comment
+  on that branch reads "Dynamic BAR1 requires RMAPI and GPU lock to be held". So a
+  framebuffer larger than BAR1 is not automatically fatal on this route: what has to fit
+  the aperture is the registered destination buffer, and cufile registers its staging
+  buffers once rather than per read. Whether GSP-RM on these cards maps a buffer above the
+  64 GiB BAR1 boundary is **not established here** — that logic is inside
+  `gsp_ga100.bin`, not in the shipped sources, and it has not been tried on this bench.
 
-The bench did take the p2pdma route once: on 2026-11-05, with the cards on the 64 GiB
-layout, cufile logged `cuFile using NVME P2PDMA mode` alongside
-`checkIfAllGPUsSupportP2PDMA(): 1`, so both requirements were met on the host as it was
-then. At the 80 GiB layout neither is met, and the two requirements fail independently:
-an nvols-patched `nvme.ko` on its own buys nothing while the framebuffer is 80 GiB.
+### What that adds up to
 
-The choice per card is therefore 64 GiB of memory with GDS and BAR1 P2P, or 80 GiB of
-memory with mailbox P2P and storage reads staged through host memory. Nothing in this
-project buys both on a card whose resizable-BAR table stops at 64 GiB.
+The bench took the native route once: on 2026-11-05, with the cards on the 64 GiB layout,
+cufile logged `cuFile using NVME P2PDMA mode` alongside `checkIfAllGPUsSupportP2PDMA(): 1`.
+Today GDS is off on all three cards, for the storage-side reason above. If it is ever
+revisited, the legacy route is the one to try, because it does not ask for the 64 GiB
+layout back; what it costs is a patched `nvme.ko`, and what it can plausibly save over
+reads staged through host memory is one DMA hop, since the read amplification of the
+workload is identical on every route.
+
+A key worth knowing before porting an A100 GDS recipe: `ForceP2P=0` is
+`NV_REG_STR_CL_FORCE_P2P`, a bit field whose `1:0`, `5:4` and `9:8` fields force P2P
+reads, writes and atomics off (`..._DISABLE` 0, `..._ENABLE` 1, `..._DEFAULT` 2), so it
+disables peer access rather than selecting a protocol. The protocol selector is
+`RMPcieP2PType`, whose values are MAILBOX 0, BAR1 1, AUTO 2 and whose default is MAILBOX.
 
 ## Verify real transfers
 

@@ -197,14 +197,16 @@ not provide. Pure P2P does not need the IOMMU disabled — it
 runs fine under the default `iommu=on`/`iommu=pt`; if peer traffic is blocked,
 the cause is ACS on the intervening bridges, not the IOMMU itself.
 
-GDS needs two things this project does not supply, and neither is the `--p2p` option:
-the GPU must publish a p2pdma resource, which on these cards takes a static BAR1 and
-therefore a framebuffer no larger than 64 GiB; and the storage driver must register
-itself with `nvidia-fs`, which the distribution's `nvme.ko` does not. Both held on the
-bench on 2026-11-05, when the cards were at 64 GiB and cufile logged
-`cuFile using NVME P2PDMA mode`. Neither holds at the 80 GiB layout, so the bench runs
-`--p2p=mailbox` without GDS and stages its storage reads through host memory. See
-[GPUDirect Storage](docs/P2P.md#gpudirect-storage) for what was measured.
+GDS needs more than this project supplies, and none of it is the `--p2p` option. cufile's
+native `use_pci_p2pdma` route needs the GPU to publish a p2pdma resource, which takes a
+static BAR1 and therefore a framebuffer no larger than 64 GiB; its legacy route maps each
+registered destination buffer into BAR1 instead, so it does not ask for the smaller
+layout, but it still needs a storage driver that registers itself with `nvidia-fs`, which
+the distribution's `nvme.ko` does not. Native p2pdma did run here on 2026-11-05, when the
+cards were at 64 GiB and cufile logged `cuFile using NVME P2PDMA mode`. Today the bench
+runs `--p2p=mailbox` with no GDS and stages its storage reads through host memory. See
+[GPUDirect Storage](docs/P2P.md#gpudirect-storage) for the two routes and what was
+measured on each.
 
 ## What Gets Unlocked
 
