@@ -6,8 +6,13 @@ mapfile -t SUPPORTED_VERSIONS < <(grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' "${SCRIPT_D
 DEFAULT_VERSION="${SUPPORTED_VERSIONS[0]:-}"
 VERSION="${CMPUNLOCKER_DRIVER_VERSION:-${DEFAULT_VERSION}}"
 ENABLE_P2P="${CMPUNLOCKER_ENABLE_P2P:-off}"
-ENABLE_80G="${CMPUNLOCKER_EXPERIMENTAL_80G:-0}"
-ENABLE_GEN4="${CMPUNLOCKER_EXPERIMENTAL_GEN4:-0}"
+# Both of these are on unless something says otherwise.  Neither one is a claim about a
+# particular card: the wide layout is taken only by a card that reports the extra FBP
+# pair, and the link target is only ever what a card's own speed fuses allow, so an
+# untouched card is unaffected by both.  The names still say "experimental" so a build
+# stamp reads the same as it always did; the default is what moved.
+ENABLE_80G="${CMPUNLOCKER_EXPERIMENTAL_80G:-1}"
+ENABLE_GEN4="${CMPUNLOCKER_EXPERIMENTAL_GEN4:-1}"
 PATCH_DIR="${SCRIPT_DIR}/patches"
 BUILD_ROOT="${CMPUNLOCKER_BUILD_DIR:-${SCRIPT_DIR}/.build}"
 SRC_NAME="open-gpu-kernel-modules-${VERSION}"
@@ -40,14 +45,16 @@ version_supported() {
     return 1
 }
 
-# P2P is a path, not a switch.  off and 1 keep their old meaning (1 is what
-# --p2p has always selected); mailbox is the second route, documented in
-# docs/P2P.md.  The variable is still the one install.sh exports, so nothing that
-# ever ran this script has to change the way it asks for a build.
+# P2P is a path, not a switch.  off keeps its old meaning; 1 says "yes" without naming
+# a route, and the route that answers is now the mailbox, the same one a bare --p2p
+# selects: it asks nothing of the host's MMIO map and it is the only route a card on the
+# wide layout can use.  BAR1 needs a BAR1 as large as the framebuffer, so it is asked for
+# by name.  Both routes are documented in docs/P2P.md.  The variable is still the one
+# install.sh exports, so nothing that ever ran this script has to change the way it asks.
 case "${ENABLE_P2P}" in
     0|off|none|'') P2P_MODE="off" ;;
-    1|bar1)        P2P_MODE="bar1" ;;
-    mailbox)       P2P_MODE="mailbox" ;;
+    bar1)          P2P_MODE="bar1" ;;
+    1|mailbox)     P2P_MODE="mailbox" ;;
     *) die "CMPUNLOCKER_ENABLE_P2P must be off, bar1 or mailbox (got: '${ENABLE_P2P}')" ;;
 esac
 case "${ENABLE_80G}" in
@@ -239,10 +246,13 @@ else
     GSP_C="${SRC_DIR}/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c"
     [[ -f "${GSP_C}" ]] || die "Missing ${GSP_C} after patching"
     [[ -f "${DYNFB_H}" ]] || die "Missing ${DYNFB_H} after dynfb"
-    # The wide geometry is opt-in twice over: the card has to report the extra
-    # FBP pair in NV_PFB_PRI_MMU_LOCAL_MEMORY_RANGE (LMR), and RegistryDwords has
-    # to carry CMPEnable80G=1 (added below).  Unburned cards never take the path,
-    # so the path is compiled in and only switched on by request.
+    # Two conditions, and the second is why untouched cards are safe: the card has to
+    # report the extra FBP pair in NV_PFB_PRI_MMU_LOCAL_MEMORY_RANGE (LMR) before the
+    # wide geometry is offered to it at all, and the build has to have compiled the path
+    # in and handed RegistryDwords CMPEnable80G=1 (added below).  A build made with
+    # --no-80g leaves the key out and the path out, and then the card keeps the layout
+    # it boots from today, which is also what the key can be dropped to from
+    # /etc/modprobe.d alone without a rebuild.
     python3 - "${DYNFB_H}" "${ENABLE_80G}" <<'PY'
 import pathlib, re, sys
 path, want = pathlib.Path(sys.argv[1]), sys.argv[2]

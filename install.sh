@@ -13,11 +13,26 @@ P2P_MODE=off
 CONFIGURE_IOMMU=1
 CONFIGURE_PASSTHROUGH=1
 DEPRECATED_GEN2_FLAG=0
+# The wide layout and the fused link speed are on by default, because neither one is
+# a claim about the card: both are read off the card at boot, so an untouched card is
+# never asked for a layout or a speed it does not have, and one install with no flags
+# serves a box of mixed cards.  P2P is the one feature still behind a flag, because it
+# is the one that needs host setup and a real transfer test to mean anything.
+# The variable names are the ones this has always used; only their default moved.
+ENABLE_80G="${CMPUNLOCKER_EXPERIMENTAL_80G:-1}"
+ENABLE_GEN4="${CMPUNLOCKER_EXPERIMENTAL_GEN4:-1}"
 for arg in "$@"; do
     case "${arg}" in
         --profile=8gb|--profile=8GB) PROFILE_OVERRIDE="8gb" ;;
         --profile=10gb|--profile=10GB) PROFILE_OVERRIDE="10gb" ;;
-        --p2p) P2P_MODE="bar1" ;;
+        # A bare --p2p names the feature and leaves the route to the default, and the
+        # default is the mailbox: BAR1 P2P needs a BAR1 as large as the framebuffer,
+        # which a card on the wide layout cannot be given (docs/P2P.md).  The BAR1
+        # route is the one that needs Above-4G MMIO from the host, so it is asked for
+        # by name.
+        --p2p) P2P_MODE="mailbox" ;;
+        --no-80g) ENABLE_80G=0 ;;
+        --no-gen4) ENABLE_GEN4=0 ;;
         --p2p=*)
             P2P_MODE="${arg#*=}"
             case "${P2P_MODE}" in
@@ -33,24 +48,41 @@ for arg in "$@"; do
         --no-passthrough) CONFIGURE_PASSTHROUGH=0 ;;
         -h|--help)
             cat <<'EOF'
-Usage: sudo ./install.sh [--profile=8gb|10gb] [--no-iommu]
-                        [--no-passthrough] [--p2p=bar1|mailbox|off]
+Usage: sudo ./install.sh [--profile=8gb|10gb] [--no-80g] [--no-gen4] [--no-iommu]
+                         [--no-passthrough] [--p2p=bar1|mailbox|off]
+
+Everything the unlock does to a card is on by default and decided per card from the
+card's own fuses, so a plain install unlocks every card it finds and asks none of them
+for a layout or a link speed it does not have. Only P2P stays behind a flag, because it
+is the one feature that also needs host setup and a real transfer test to mean anything.
 
   --profile=8gb   Force 8GB metadata label (geometry is still chosen per PCI ID)
   --profile=10gb  Force 10GB metadata label (geometry is still chosen per PCI ID)
-  --p2p          Same as --p2p=bar1.
+  --no-80g        Keep hardware-unlocked cards on the 64 GiB layout. On by default:
+                  a card whose framebuffer fuses were burned reports the hidden FBP
+                  pair before the driver writes anything and is sized from its own
+                  CFG1/LMR to the wide (80 GiB) layout. Untouched cards keep 64 GiB,
+                  and a card that cannot boot the wide layout steps back one layout
+                  instead of staying down.
+  --no-gen4       Leave every card at Gen2. On by default: each card is asked for the
+                  speed its own PCIe speed fuses allow, so a soft-unlocked card stays
+                  at Gen2 and a burned card reaches Gen4 where the slot carries it.
+  --p2p          Same as --p2p=mailbox: no large BAR1 needed, and the only route a card
+                  on the wide (80 GiB) layout can take.
   --p2p=bar1     GPU-to-GPU P2P through a static BAR1 that maps the whole
                   framebuffer, with the copy engine DMAing into the peer. Needs a
                   BAR1 at least as large as each card's framebuffer, and the card's
                   resizable-BAR capability table stops at 64 GiB, so a card on the
-                  80 GiB layout cannot take this path.
+                  80 GiB layout cannot take this path. It is also the route GPUDirect
+                  Storage's native p2pdma mode needs, which is why it stays available.
   --p2p=mailbox  GPU-to-GPU P2P through the NV_P2P write-mailbox aperture instead:
                   64 KiB per peer at the bottom of BAR1 and no framebuffer mapping,
                   which is what leaves it as the route for a card whose framebuffer
                   is bigger than any BAR1 it can be given. Needs the PRI decode
                   trap that the closed GSP-RM is denied for those registers to be
                   armable; where it is not, the driver leaves P2P unsupported rather
-                  than reporting copies that move garbage. Measured at Gen2 only.
+                  than reporting copies that move garbage. Measured on two 80 GiB
+                  cards at Gen4 x16, 20-25 GB/s per direction.
                   See docs/P2P.md before choosing.
   --p2p=off      No P2P overrides (the default).
                   Whichever path: a capability report is not a transfer, so verify
@@ -71,7 +103,7 @@ the kernel command line so the IOMMU runs in passthrough mode. This takes effect
 on the next reboot.
 
 Without --profile, each unlockable GPU is classified by PCI device ID:
-  10de:20c2 → 8gb / 64GB unlock
+  10de:20c2 → 8gb / 64GB unlock, 80GB on a card whose framebuffer fuses were burned
   10de:2082 → 10gb / 40GB unlock
 
 Multi-GPU and mixed 8GB+10GB systems are supported in one install.
@@ -81,6 +113,20 @@ EOF
         *)
             echo "Unknown argument: ${arg}" >&2
             echo "Try: sudo ./install.sh --help" >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Checked here, before anything is downloaded or built: these two used to be opt-in
+# environment variables, and a typo in one of them used to mean "stay on the small
+# layout" silently.  Now that they default to on, a bad value says so.
+for flag in "${ENABLE_80G}" "${ENABLE_GEN4}"; do
+    case "${flag}" in
+        0|1) ;;
+        *)
+            echo "CMPUNLOCKER_EXPERIMENTAL_80G and CMPUNLOCKER_EXPERIMENTAL_GEN4 take 0 or 1" >&2
+            echo "(got '${flag}'; --no-80g and --no-gen4 are the flags for the installer)" >&2
             exit 1
             ;;
     esac
@@ -196,6 +242,12 @@ case "${CARD_PROFILE}" in
         ;;
 esac
 
+if [[ "${ENABLE_80G}" == "1" ]]; then
+    # The table above is what the profile guarantees; the card's own fuses decide the
+    # wide layout on top of it, per card, at boot.
+    info "Burned cards take the wide layout on top of that (80GiB on 20c2); dmesg's CMP-DYN DECISION line is the per-card answer"
+fi
+
 GPU_INVENTORY_LINES=()
 for i in "${!GPU_BDFS[@]}"; do
     GPU_INVENTORY_LINES+=("${GPU_BDFS[$i]} ${GPU_DEVIDS[$i]} ${GPU_PROFILES[$i]} ${GPU_EXPECTED[$i]}")
@@ -270,20 +322,25 @@ elif [[ "${P2P_MODE}" == "mailbox" ]]; then
     warn "lines in dmesg, and check copied bytes, not just cuMemcpyPeer's return."
     warn "tools/p2p-content-check.py is what catches a mailbox that was never armed."
 else
-    info "P2P overrides disabled (use --p2p=bar1 or --p2p=mailbox to enable)"
+    info "P2P overrides disabled (use --p2p for the mailbox route or --p2p=bar1)"
 fi
-if [[ "${CMPUNLOCKER_EXPERIMENTAL_GEN4:-0}" == "1" ]]; then
+if [[ "${ENABLE_80G}" == "1" ]]; then
+    info "Wide layout on: a burned card is sized from its own fuses to 80GiB"
+else
+    info "80GiB path compiled out (off with --no-80g); a burned card keeps 64GiB"
+fi
+if [[ "${ENABLE_GEN4}" == "1" ]]; then
     info "Asking each card for the PCIe speed its own fuses allow (cmp_pcie_gen=0)"
 else
-    info "Every card stays at Gen2 (CMPUNLOCKER_EXPERIMENTAL_GEN4=1 asks per card)"
+    info "Every card stays at Gen2 (off with --no-gen4; drop it to ask per card)"
 fi
 chmod +x "${SCRIPT_DIR}/driver/build.sh"
 CMPUNLOCKER_DRIVER_VERSION="${detected}" \
 CMPUNLOCKER_CARD_PROFILE="${CARD_PROFILE}" \
 CMPUNLOCKER_GPU_INVENTORY="${CMPUNLOCKER_GPU_INVENTORY}" \
 CMPUNLOCKER_ENABLE_P2P="${P2P_MODE}" \
-CMPUNLOCKER_EXPERIMENTAL_80G="${CMPUNLOCKER_EXPERIMENTAL_80G:-0}" \
-CMPUNLOCKER_EXPERIMENTAL_GEN4="${CMPUNLOCKER_EXPERIMENTAL_GEN4:-0}" \
+CMPUNLOCKER_EXPERIMENTAL_80G="${ENABLE_80G}" \
+CMPUNLOCKER_EXPERIMENTAL_GEN4="${ENABLE_GEN4}" \
     "${SCRIPT_DIR}/driver/build.sh"
 ok "Patched modules installed (profile ${CARD_PROFILE})"
 
@@ -499,6 +556,16 @@ else
         echo "     dmesg | grep CMP-P2P is the difference between armed and not"
     fi
 fi
+if [[ "${ENABLE_80G}" == "1" ]]; then
+    echo "Memory:  per card from its own fuses; wide (80 GiB) layout on"
+else
+    echo "Memory:  profile table only; wide layout compiled out (--no-80g)"
+fi
+if [[ "${ENABLE_GEN4}" == "1" ]]; then
+    echo "PCIe:    per card from its own speed fuses (Gen4 where the card and slot allow)"
+else
+    echo "PCIe:    every card pinned to Gen2 (--no-gen4)"
+fi
 if [[ -n "${IOMMU_PARAMS}" && "${IOMMU_STATUS}" != "skipped" ]]; then
     echo "IOMMU:   ${IOMMU_PARAMS} (${IOMMU_STATUS})"
 else
@@ -510,7 +577,7 @@ printf "  %-16s %-8s %-8s %s\n" "BDF" "PCI ID" "Variant" "Expect MiB"
 for i in "${!GPU_BDFS[@]}"; do
     printf "  %-16s %-8s %-8s ~%s\n" "${GPU_BDFS[$i]}" "${GPU_DEVIDS[$i]}" "${GPU_PROFILES[$i]}" "${GPU_EXPECTED[$i]}"
 done
-if [[ "${CMPUNLOCKER_EXPERIMENTAL_80G:-0}" == "1" ]]; then
+if [[ "${ENABLE_80G}" == "1" ]]; then
     echo "  That table is the floor, not the ceiling: a card whose framebuffer fuses"
     echo "  were burned takes the wide layout and comes up larger (80 GiB on an 8 GB"
     echo "  SKU).  dmesg's CMP-DYN DECISION line is the per-card answer, read back"
@@ -520,8 +587,8 @@ echo ""
 echo "Next:"
 echo -e "  1. Cold reboot recommended: ${CYAN}sudo shutdown -h now${NC}  (then power on)"
 echo -e "  2. Verify all GPUs: ${CYAN}sudo ./verify.sh${NC}"
-if [[ "${CMPUNLOCKER_EXPERIMENTAL_GEN4:-0}" == "1" ]]; then
-    echo -e "  3. PCIe: Gen2 or better everywhere; a card whose speed fuses were cleared asks for"
+if [[ "${ENABLE_GEN4}" == "1" ]]; then
+    echo -e "  3. PCIe: Gen2 or better everywhere; a card whose speed fuses allow it asks for"
     echo -e "     Gen4 and keeps the speed its link actually trains (Gen3 under a Gen3 bridge),"
     echo -e "     falling back to Gen2 only if nothing above Gen2 holds.  Read the negotiated link,"
     echo -e "     not what the SKU claims: ${CYAN}cat /sys/bus/pci/devices/<bdf>/current_link_speed${NC},"

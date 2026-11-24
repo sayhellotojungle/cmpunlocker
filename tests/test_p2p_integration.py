@@ -113,6 +113,8 @@ elif name == "curl":
 
 
 class P2PIntegration(unittest.TestCase):
+    INSTALL_OPTIONS = ["--no-iommu", "--no-gen2-service", "--no-passthrough"]
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix=".p2p-test-", dir=ROOT)
         self.addCleanup(self.temp.cleanup)
@@ -219,14 +221,81 @@ class P2PIntegration(unittest.TestCase):
         return self.events(clear=True)
 
     def test_default_and_empty_disable_all_p2p_patches(self):
+        """A default build carries no P2P route, and does carry the rest of the unlock.
+
+        P2P is the only part of this still behind a flag: a build that was not asked
+        for one applies the base patch set and writes the module options that make the
+        per-card unlock work — the wide layout allowed for a burned card, and a link
+        allow-mask high enough for a card whose speed fuses allow more than Gen2.
+        """
         events = self.successful_build()
         self.assertEqual(sum(e["cmd"] == "patch" for e in events), BASE_PATCHES)
         self.assertEqual((self.moddir / "p2p_enabled").read_text(), "off\n")
         self.assertEqual(self.conf.read_text(),
-                         'options nvidia NVreg_EnableResizableBar=1 '
-                         'NVreg_RegistryDwords="RmForceEnableGen2=1;RMPcieLinkSpeed=0x1;'
-                         'RmForceDisableIomapWC=1"\n')
+                         'options nvidia cmp_pcie_gen=0 NVreg_EnableResizableBar=1 '
+                         'NVreg_RegistryDwords="RmForceEnableGen2=1;RMPcieLinkSpeed=0xF;'
+                         'RmForceDisableIomapWC=1;CMPEnable80G=1"\n')
         self.assertFalse(any(e["cmd"] == "patch" for e in self.successful_build("")))
+
+    def installer_conf(self, *options, **env):
+        """A full install run in the sandbox, returning the modprobe config it wrote."""
+        result = self.run_script("install.sh", list(self.INSTALL_OPTIONS) + list(options),
+                                 **env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return self.conf.read_text()
+
+    def test_a_default_install_asks_for_the_wide_layout_and_the_fused_speed(self):
+        """80 GiB and Gen4 are on for an install that was told nothing.
+
+        Neither key is a claim about a particular card.  CMPEnable80G lets a card that
+        reports the hidden FBP pair program the wide layout, and RMPcieLinkSpeed is only
+        a ceiling: cmp_pcie_gen=0 asks each card for what its own speed fuses allow, so a
+        soft-unlocked card still trains Gen2.  A default install is therefore the answer
+        for a box of mixed cards, which is why these are defaults and P2P is not.
+        """
+        conf = self.installer_conf()
+        self.assertIn("CMPEnable80G=1", conf)
+        self.assertIn("RMPcieLinkSpeed=0xF", conf)
+        self.assertIn("cmp_pcie_gen=0", conf)
+
+    def test_no_80g_drops_the_key_and_the_build_cache_notices(self):
+        """Backing the wide layout out is a rebuild, not just a dropped key.
+
+        The registry key only means anything to a driver that compiled the wide path in,
+        so the two have to move together, and the stamp is what keeps a cached wide build
+        from being installed under a config that no longer asks for it.  The old
+        environment spelling has to still work: it is what every existing call, log and
+        recovery note uses.
+        """
+        wide = self.installer_conf()
+        wide_stamp = (self.build_root / self.src_name / ".cmpunlocker-stamp").read_text()
+        conf = self.installer_conf("--no-80g")
+        self.assertIn("CMPEnable80G=1", wide)
+        self.assertNotIn("CMPEnable80G", conf)
+        self.assertNotEqual(wide_stamp,
+                            (self.build_root / self.src_name / ".cmpunlocker-stamp").read_text(),
+                            "--no-80g reused the cached wide build")
+        conf = self.installer_conf(CMPUNLOCKER_EXPERIMENTAL_80G="0")
+        self.assertNotIn("CMPEnable80G", conf)
+
+    def test_no_gen4_leaves_every_card_at_gen2(self):
+        """The other switch, and the two are independent of each other."""
+        conf = self.installer_conf("--no-gen4")
+        self.assertNotIn("cmp_pcie_gen", conf)
+        self.assertIn("RMPcieLinkSpeed=0x1", conf)
+        self.assertIn("CMPEnable80G=1", conf, "--no-gen4 turned off the wide layout too")
+
+    def test_a_switch_that_is_neither_0_nor_1_fails_before_anything_is_built(self):
+        """These two used to be off, so a typo meant "stay small" silently."""
+        for value in ("2", "yes"):
+            for name in ("CMPUNLOCKER_EXPERIMENTAL_80G", "CMPUNLOCKER_EXPERIMENTAL_GEN4"):
+                with self.subTest(name=name, value=value):
+                    result = self.run_script("install.sh", self.INSTALL_OPTIONS,
+                                             **{name: value})
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("take 0 or 1", result.stdout + result.stderr)
+        self.assertFalse(self.conf.exists())
+        self.assertFalse(any(e["cmd"] in ("patch", "make") for e in self.events()))
 
     def test_the_feature_is_passed_to_the_hook_placer(self):
         """--p2p reaches the hooks, because nothing else gates them any more.
@@ -236,13 +305,22 @@ class P2PIntegration(unittest.TestCase):
         build.sh runs is the one place where "this build has no P2P in it" and "this
         build is the mailbox one" get decided.  Logged by the double, which sees the
         argv as build.sh wrote it.  0 and 1 are the spellings that existed before the
-        second path, and they still mean what they meant then.
+        second path: 0 still says off, and 1 says yes without naming a route, which now
+        answers the mailbox, the route a bare --p2p takes.  A mode that is already the
+        installed one is a cache hit, and a cache run places no hooks: what it installed
+        still has to be the route that was asked for, so the marker is checked either way
+        and the argv only on a run that placed something.
         """
         for value, asked in (("off", "--p2p=off"), ("bar1", "--p2p=bar1"),
-                             ("mailbox", "--p2p=mailbox"), ("1", "--p2p=bar1"),
+                             ("mailbox", "--p2p=mailbox"), ("1", "--p2p=mailbox"),
                              ("0", "--p2p=off")):
             events = self.successful_build(value)
+            self.assertEqual((self.moddir / "p2p_enabled").read_text(),
+                             asked.split("=", 1)[1] + "\n",
+                             "CMPUNLOCKER_ENABLE_P2P=%s installed the wrong route" % value)
             argv = [e["argv"] for e in events if e["cmd"] == "dynfb"]
+            if not argv:
+                continue
             self.assertEqual(len(argv), 1, "one placement step per build: %r" % argv)
             self.assertIn(asked, argv[0].split(), "CMPUNLOCKER_ENABLE_P2P=%s" % value)
 
@@ -365,14 +443,24 @@ class P2PIntegration(unittest.TestCase):
         result = self.run_script("install.sh", options, CMPUNLOCKER_ENABLE_P2P="bar1")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((self.moddir / "p2p_enabled").read_text(), "off\n")
+        # A bare --p2p names the feature and takes the default route, and the default is
+        # the mailbox: a card on the wide layout has no BAR1 that covers its
+        # framebuffer, so the BAR1 route cannot be what an unnamed request gets.
         result = self.run_script("install.sh", options + ["--p2p", "--profile=10gb"])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual((self.moddir / "p2p_enabled").read_text(), "bar1\n")
+        self.assertEqual((self.moddir / "p2p_enabled").read_text(), "mailbox\n")
         self.assertEqual((self.moddir / "card_profile").read_text(), "mixed\n")
         self.assertIn("20c2 8gb 65536", (self.moddir / "gpu_inventory").read_text())
         self.assertIn("2082 10gb 40960", (self.moddir / "gpu_inventory").read_text())
+        self.assertIn("CMPEnableP2PMailbox=1", self.conf.read_text())
+        self.assertNotIn("RMForceStaticBar1", self.conf.read_text())
+        # The other route is still there, and naming it is what selects it.
+        result = self.run_script("install.sh", options + ["--p2p=bar1"])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.moddir / "p2p_enabled").read_text(), "bar1\n")
         self.assertIn("RMForceStaticBar1=1", self.conf.read_text())
-        # The same script, the second path: what the flag selects has to reach the
+        self.assertNotIn("CMPEnableP2PMailbox", self.conf.read_text())
+        # The same script, spelled out: what the flag selects has to reach the
         # build, and what the build writes has to say mailbox and nothing else.
         result = self.run_script("install.sh", options + ["--p2p=mailbox"])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -380,7 +468,8 @@ class P2PIntegration(unittest.TestCase):
         self.assertIn("CMPEnableP2PMailbox=1", self.conf.read_text())
         self.assertNotIn("RMForceStaticBar1", self.conf.read_text())
         help_text = self.run_script("install.sh", ["--help"]).stdout
-        for advertised in ("--p2p=bar1", "--p2p=mailbox", "--p2p=off"):
+        for advertised in ("--p2p=bar1", "--p2p=mailbox", "--p2p=off",
+                           "--no-80g", "--no-gen4"):
             self.assertIn(advertised, help_text)
 
     def test_an_unknown_p2p_path_is_refused_before_anything_is_built(self):

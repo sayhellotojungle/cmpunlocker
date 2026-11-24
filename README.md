@@ -1,32 +1,36 @@
 ## About this project
 
-This project unlocks NVIDIA CMP 170HX / A16 memory beyond the capacity the SKU reports,
-brings the PCIe link up to Gen4 on hardware-unlocked cards, and optionally enables
-GPU-to-GPU P2P over BAR1 or over RM's write mailbox. It is delivered as a set of patches
-applied to a stock `open-gpu-kernel-modules` release, with an installer, a verification
+This project unlocks NVIDIA CMP 170HX / A16 memory beyond the capacity the SKU reports
+and brings the PCIe link up to Gen4 on hardware-unlocked cards; both are on in a plain
+install. GPU-to-GPU P2P over BAR1 or over RM's write mailbox is the one part still behind
+a flag. It is delivered as a set of patches applied to a stock
+`open-gpu-kernel-modules` release, with an installer, a verification
 script and an uninstaller.
 
 Implemented functions:
 
 - **GPU-to-GPU P2P.** Optional, off by default, enabled with `--p2p=bar1` or
-  `--p2p=mailbox`. The first is the BAR1 path: capability override, resizable BAR and the
+  `--p2p=mailbox`; a bare `--p2p` takes the mailbox route, the one that needs no large
+  BAR1 and the only one open to a card on the wide layout.
+  The BAR1 route is the older path: capability override, resizable BAR and the
   BAR1 DMA path, restricted to CMP device ids, and it needs a BAR1 as large as the
-  framebuffer it maps. The second reaches the peer through the `NV_P2P` write mailbox
-  instead, 64 KiB per peer and no framebuffer mapping, so it is the route left to a card
-  whose framebuffer outgrows every BAR1 it can be given — and on this hardware it is the
-  faster of the two where the card cannot take a large BAR1, at the Gen4 link rate.
-- **80 GiB memory unlock on hardware-unlocked cards.** The capacity is derived from the
-  card's own partition count and partition size, not from a card table. A card that cannot
-  boot the wide layout steps back one layout and records the stage. Other cards are unlocked
-  to 64 GiB (`10de:20c2`) or 40 GiB (`10de:2082`) from the card profile table.
+  framebuffer it maps. The mailbox route reaches the peer through the `NV_P2P` write
+  mailbox instead, 64 KiB per peer and no framebuffer mapping, so it is the route left to a
+  card whose framebuffer outgrows every BAR1 it can be given — and on this hardware it is
+  the faster of the two where the card cannot take a large BAR1, at the Gen4 link rate.
+- **80 GiB memory unlock on hardware-unlocked cards, on by default.** The capacity is
+  derived from the card's own partition count and partition size, not from a card table. A
+  card that cannot boot the wide layout steps back one layout and records the stage. Other
+  cards are unlocked to 64 GiB (`10de:20c2`) or 40 GiB (`10de:2082`) from the card profile
+  table, and `--no-80g` keeps every card on that table.
 - **Coexistence of soft-unlocked and hardware-unlocked cards, detected automatically.** Each
   card is classified and sized at boot from its own registers, so one build and one driver
   serve a machine that holds both kinds.
-- **PCIe Gen4 on hardware-unlocked cards.** Every supported card is retrained from Gen1 to
-  Gen2 at driver init. Above Gen2, a per-card sequence supplies the PHY initialisation the
-  VBIOS omits; the target is the card's own speed fuses, so a soft-unlocked card stays at
-  Gen2. A link that cannot reach its target keeps the speed it trained, down to but not
-  below Gen2.
+- **PCIe Gen4 on hardware-unlocked cards, on by default.** Every supported card is retrained
+  from Gen1 to Gen2 at driver init. Above Gen2, a per-card sequence supplies the PHY
+  initialisation the VBIOS omits; the target is the card's own speed fuses, so a
+  soft-unlocked card stays at Gen2 and `--no-gen4` leaves every card there. A link that
+  cannot reach its target keeps the speed it trained, down to but not below Gen2.
 
 ### Differences from the upstream branch
 
@@ -36,7 +40,8 @@ This tree merges the P2P implementation from
 preserved. Beyond the merge itself:
 
 - P2P is a build-time option (`--p2p=bar1|mailbox`), off by default; builds without the flag do not
-  contain the P2P changes at all, and a build carries one route rather than both.
+  contain the P2P changes at all, and a build carries one route rather than both. A bare
+  `--p2p` names the feature and takes the mailbox route; `bar1` has to be asked for by name.
 - The mailbox route is not the fork's version of it. The fork reported capability support
   unconditionally, which on a card whose PRI trap cannot be armed meant P2P "worked" and
   moved garbage; here the override reads back the trap's privilege mask first and leaves
@@ -102,14 +107,31 @@ sudo ./install.sh --profile=10gb   # 10GB card → 40GB unlock
 
 Then perform a cold reboot (full power off, then boot).
 
+Everything the installer decides about a card is on for that install, and every one of
+those decisions is read off the card itself, so a plain `sudo ./install.sh` is the right
+command for a box of mixed cards:
+
+| On by default | Back it out with |
+| --- | --- |
+| Memory unlock from the profile table (64 GiB on `10de:20c2`, 40 GiB on `10de:2082`) | `--profile=` |
+| The wide (80 GiB) layout, for a card whose framebuffer fuses were burned | `--no-80g` |
+| The PCIe speed each card's own fuses allow (Gen4 on a burned card, Gen2 on a soft card) | `--no-gen4` |
+| ECC on DRAM and SRAM, and the full SM count | nothing to back out |
+| VM passthrough preparation | `--no-passthrough` |
+| IOMMU kernel parameters (`intel_iommu=on`/`amd_iommu=on` plus `iommu=pt`) | `--no-iommu` |
+
+P2P is the only feature left behind a flag, because it is the only one that needs
+something from the host as well as from the driver, and because a capability matrix on a
+machine where nothing actually moves is indistinguishable from success.
+
 ### Optional GPU-to-GPU P2P
 
 This build ships two GPU-to-GPU P2P routes. Both are off by default, and a build
 carries one of them, never both:
 
 ```bash
-sudo ./install.sh --p2p=bar1      # same as plain --p2p
-sudo ./install.sh --p2p=mailbox
+sudo ./install.sh --p2p            # the mailbox route, the default of the two
+sudo ./install.sh --p2p=bar1       # the BAR1 route, asked for by name
 # Can be combined with the existing options:
 sudo ./install.sh --p2p=mailbox --profile=8gb --no-passthrough
 ```
@@ -158,7 +180,8 @@ sudo env CMPUNLOCKER_ENABLE_P2P=bar1   ./driver/build.sh
 sudo env CMPUNLOCKER_ENABLE_P2P=mailbox ./driver/build.sh
 ```
 
-`off`, `0` and the empty string disable it; `1` is the old spelling of `bar1`. On a
+`off`, `0` and the empty string disable it. `bar1` is spelled out; `1`, which says yes
+without naming a route, means `mailbox`, the same thing a bare `--p2p` means. On a
 host where the resize above is the problem rather than the card, `mailbox` is the
 route that does not need a large BAR1 at all.
 
@@ -199,7 +222,9 @@ the cause is ACS on the intervening bridges, not the IOMMU itself.
 
 GDS needs more than this project supplies, and none of it is the `--p2p` option. cufile's
 native `use_pci_p2pdma` route needs the GPU to publish a p2pdma resource, which takes a
-static BAR1 and therefore a framebuffer no larger than 64 GiB; its legacy route maps each
+static BAR1 and therefore a framebuffer no larger than 64 GiB — on a card whose fuses were
+burned, that means installing with `--no-80g` as well as `--p2p=bar1`; its legacy route
+maps each
 registered destination buffer into BAR1 instead, so it does not ask for the smaller
 layout, but it still needs a storage driver that registers itself with `nvidia-fs`, which
 the distribution's `nvme.ko` does not. Native p2pdma did run here on 2026-11-05, when the
@@ -249,9 +274,9 @@ measured on each.
   </tr>
   <tr>
     <td>GPU-to-GPU P2P</td>
-    <td>Optional: --p2p=bar1 (needs a BAR1 as large as the framebuffer) or
-    --p2p=mailbox (verified on two 80 GiB cards at Gen4, ~20-25 GB/s per direction,
-    no large BAR1 needed); requires host setup and real transfer verification</td>
+    <td>Optional: --p2p (mailbox, the default route; no large BAR1 needed, verified on two
+    80 GiB cards at Gen4, ~20-25 GB/s per direction) or --p2p=bar1 (needs a BAR1 as large
+    as the framebuffer); requires host setup and real transfer verification</td>
   </tr>
   <tr>
     <td>Persistence across reboot (patched modules)</td>
@@ -337,14 +362,20 @@ card itself, so any slot works and cards can be mixed freely.
   unchanged when read again with the serving workload running; the Gen3 tier is the
   fallback path and was not exercised on this machine.
 
-`CMPUNLOCKER_EXPERIMENTAL_80G=1` adds `CMPEnable80G=1` to `RegistryDwords` and is
-what lets a burned card take the wide layout; it is off by default and part of the
-build cache. The key can also be dropped from `/etc/modprobe.d/cmp-pcie-gen2.conf`
-to back a single machine out without a rebuild. `CMPDynDebug=1` adds the register
-dumps. `CMPUNLOCKER_EXPERIMENTAL_GEN4=1` writes `cmp_pcie_gen=0` into that same
-file, which asks each card for the speed its own fuses allow, and raises
-`RMPcieLinkSpeed` to `0xF` so RM agrees with the link the driver trains; with the
-flag off the built-in `cmp_pcie_gen=2` leaves every card at Gen2, as before.
+Both switches are on for a normal install, and both are part of the build cache, so
+`--no-80g` and `--no-gen4` are rebuilds rather than reconfigurations. `--no-80g`, or the
+environment spelling `CMPUNLOCKER_EXPERIMENTAL_80G=0`, leaves `CMPEnable80G` out of
+`RegistryDwords` and compiles the wide-geometry path out of the driver, which is what
+lets a burned card take the wide layout and what takes it away again; on a build that
+compiled the path in, dropping the key from
+`/etc/modprobe.d/cmp-pcie-gen2.conf` backs a single machine out without a rebuild, and
+that is also the cheaper first move when a card turns out not to boot wide.
+`CMPDynDebug=1` adds the register
+dumps. `--no-gen4`, or `CMPUNLOCKER_EXPERIMENTAL_GEN4=0`, leaves `cmp_pcie_gen` out of
+that same file, so the built-in `cmp_pcie_gen=2` pins every card at Gen2 as before, and
+lowers `RMPcieLinkSpeed` to `0x1` so RM is not allowed above the link the driver trains;
+with the switch on, `cmp_pcie_gen=0` asks each card for the speed its own fuses allow and
+`RMPcieLinkSpeed` is `0xF`, so RM agrees with the link the driver actually brings up.
 `verify.sh` reports the layout each card ended up with, and
 [docs/BOOT-RECOVERY.zh-CN.md](docs/BOOT-RECOVERY.zh-CN.md) covers recovery.
 

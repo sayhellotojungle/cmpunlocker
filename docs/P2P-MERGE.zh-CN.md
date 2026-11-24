@@ -3,9 +3,10 @@
 以 `cmpunlocker-0.4` 为基础，已融合附件中 `cmpunlocker-p2p` 的 `--p2p`
 参数及其驱动实现。本仓库根目录即合并后的主项目。
 
-P2P 现在是两条路线而不是一个开关：`--p2p=bar1` 是上面那次合并进来的 BAR1 路径
-（等价于旧写法 `--p2p`、`CMPUNLOCKER_ENABLE_P2P=1`），`--p2p=mailbox` 走
-`NV_P2P` 写邮箱孔径，不需要大 BAR1，是给 80 GiB 布局那张卡留的路。一个构建只带其中
+P2P 现在是两条路线而不是一个开关：`--p2p=bar1` 是上面那次合并进来的 BAR1 路径，
+必须显式点名；裸 `--p2p` 和 `CMPUNLOCKER_ENABLE_P2P=1` 这种「只说要 P2P、不指定路线」
+的写法现在都落在 `--p2p=mailbox` 上——它走 `NV_P2P` 写邮箱孔径，不需要大 BAR1，也是 80
+GiB 布局那张卡唯一还能走的那条，因为它的显存大于这张卡能给出的任何 BAR1。一个构建只带其中
 一条：RM 每对 peer 只承载一种 PCIe P2P 协议（`kbusIsPcieBar1P2PMappingSupported_GH100`
 的第 4 道门会因 peer 已被另一条占用而拒绝），混着打补丁只会得到先到那条，另一条被
 静默拒绝，因此 `tests/test_patches.py` 直接断言两个补丁清单不相交。
@@ -15,8 +16,8 @@ P2P 现在是两条路线而不是一个开关：`--p2p=bar1` 是上面那次合
 在项目根目录运行：
 
 ```bash
-sudo ./install.sh --p2p=bar1      # 同 --p2p
-sudo ./install.sh --p2p=mailbox
+sudo ./install.sh --p2p             # 等同 --p2p=mailbox
+sudo ./install.sh --p2p=bar1        # BAR1 路线，需显式指定
 ```
 
 可以与原有 `--profile=8gb|10gb`、`--no-iommu`、`--no-passthrough` 一起使用
@@ -29,9 +30,15 @@ sudo ./install.sh --p2p=mailbox
 sudo env CMPUNLOCKER_ENABLE_P2P=mailbox ./driver/build.sh
 ```
 
-取值是 `off|bar1|mailbox`（`0`、空、`none` 等同 `off`；`1` 仍等同 `bar1`），
-其他值在动手构建之前就被拒绝。重新运行不带 `--p2p` 的安装命令可关闭 P2P，随后冷启动。
+取值是 `off|bar1|mailbox`（`0`、空、`none` 等同 `off`；`1` 只说「要 P2P」而不点名路线，因此
+等同 `mailbox`），其他值在动手构建之前就被拒绝。重新运行不带 `--p2p` 的安装命令可关闭
+P2P，随后冷启动。
 升级内核后，仍按 `0.4` 的方式手动重新安装；需要 P2P 时务必继续传入同一个 `--p2p=` 选择。
+
+P2P 是唯一还需要显式打开的部分，其余按卡的决定都是默认开的：宽（80 GiB）布局与按熔丝
+取 PCIe 代际，两者都只在卡自己的熔丝允许时才生效，没动过的卡不受影响。要退回就用
+`--no-80g`（硬破解卡留在 64 GiB 布局）和 `--no-gen4`（所有卡钉在 Gen2），旧的环境变量
+写法 `CMPUNLOCKER_EXPERIMENTAL_80G=0`、`CMPUNLOCKER_EXPERIMENTAL_GEN4=0` 同样有效。
 
 ## 两种写法的分工
 
@@ -61,7 +68,7 @@ sudo env CMPUNLOCKER_ENABLE_P2P=mailbox ./driver/build.sh
 | 主机读能力修正 | 迁入 CMP 读能力覆盖，并去掉原补丁对已禁用 `0014` 调试补丁的上下文依赖。 |
 | BAR1 resize | 保留 `0.4` 已有的等效实现，不重复应用同一功能的补丁。 |
 | 安装配置 | 将 `RmForceEnableGen2=1` 与所选路线的键写入同一条 `NVreg_RegistryDwords`，在生成 initramfs 前完成：bar1 加 `RMForceStaticBar1=1;RMPcieP2PType=1`，mailbox 只加 `CMPEnableP2PMailbox=1`。 |
-| 按卡动态解锁 | `driver/dynfb/`：`cmp_dynamic.h` 是策略本体，`apply.py` 在打完补丁后按**锚点**把钩子植入驱动（不用上下文窗口；锚点大多是我们自己补丁里的代码，因此与驱动版本无关）。判据是卡自己的 `LMR` 分区数与 `CFG1` 分区大小，只有 `0x20C2` 且分区数超过 8 的卡吃 80GiB（PCIe 能力不作判据）；默认关闭（`CMPUNLOCKER_EXPERIMENTAL_80G=0`）；只有 booter 超时才逐级退回并写入 registry。无条件 Gen2 初始化保留；Gen4 走 Gen3→E1→Gen4（`dynfb/hooks/nv_gen4.c`），目标代际读每张卡自己的 `LNKCAP2` 熔丝，软解卡自动留在 Gen2；没到目标时按 `LnkSta` 实际训练到的代际收口（桥只到 Gen3 就留在 Gen3），连 Gen3 都没站住才调 Gen2 重训收回；开关是 `CMPUNLOCKER_EXPERIMENTAL_GEN4=1`。每个决定打印 `CMP-DYN` 内核日志，详见 `BOOT-RECOVERY.zh-CN.md`。 |
+| 按卡动态解锁 | `driver/dynfb/`：`cmp_dynamic.h` 是策略本体，`apply.py` 在打完补丁后按**锚点**把钩子植入驱动（不用上下文窗口；锚点大多是我们自己补丁里的代码，因此与驱动版本无关）。判据是卡自己的 `LMR` 分区数与 `CFG1` 分区大小，只有 `0x20C2` 且分区数超过 8 的卡吃 80GiB（PCIe 能力不作判据）；**默认开启**，`--no-80g`（或 `CMPUNLOCKER_EXPERIMENTAL_80G=0`）把这条路径整个编译掉并去掉 registry 键；只有 booter 超时才逐级退回并写入 registry。无条件 Gen2 初始化保留；Gen4 走 Gen3→E1→Gen4（`dynfb/hooks/nv_gen4.c`），目标代际读每张卡自己的 `LNKCAP2` 熔丝，软解卡自动留在 Gen2；没到目标时按 `LnkSta` 实际训练到的代际收口（桥只到 Gen3 就留在 Gen3），连 Gen3 都没站住才调 Gen2 重训收回；**默认开启**，`--no-gen4`（或 `CMPUNLOCKER_EXPERIMENTAL_GEN4=0`）把每张卡钉在 Gen2。每个决定打印 `CMP-DYN` 内核日志，详见 `BOOT-RECOVERY.zh-CN.md`。 |
 | 关闭与重建 | 所选路线名进入缓存标记；在 `off`/`bar1`/`mailbox` 之间切换会重新解压驱动源码。关闭时同时清除配置中该路线的 P2P 参数。 |
 | 验证 | 记录 `p2p_enabled`（值为路线名），增加能力矩阵提示、真实 CUDA 读写校验程序、逐字节内容校验程序 `tools/p2p-content-check.py` 和离线回归测试。 |
 

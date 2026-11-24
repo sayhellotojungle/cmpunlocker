@@ -138,7 +138,8 @@ if [[ -n "${dyn_logs}" ]]; then
     if (( wide > 0 )); then
         ok "${wide} card(s) booted with the wide (80 GiB) layout"
     else
-        info "no card took the wide layout (CMPEnable80G off, or no burned card)"
+        info "no card took the wide layout: no card reported the spare FBP pair, or"
+        info "this build was installed with --no-80g and has the path compiled out"
     fi
     if (( back > 0 )); then
         warn "the booter gave up on a layout ${back} time(s) and stepped back; that"

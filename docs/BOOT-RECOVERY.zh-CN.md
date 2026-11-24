@@ -28,11 +28,14 @@ GPU2此前还报Falcon超时0x65和Xid140；WPR日志已显示80GiB。
 
 ## 本地恢复版
 
-默认关闭自动 80GiB 提升：不开开关时，每张卡仍按 profile 容量表的 CFG1/LMR 配方
-启动。开关打开后，宽布局不来自设备 ID 表，而是从卡自己的 `LMR` 分区数与 `CFG1`
-分区大小推导，只有 `0x20C2` 且分区数超过 8 的卡会被授予；booter 超时才逐级退回。
-无条件保留原有 Gen2 强制路径。实验开关 `CMPUNLOCKER_EXPERIMENTAL_80G`
-默认 0，并计入构建缓存。10-FBPA 配方只保留作研究，不能宣称已修复硬破解卡。
+默认开启自动 80GiB 提升：一张卡是否走宽布局不来自设备 ID 表，而是从卡自己的 `LMR`
+分区数与 `CFG1` 分区大小推导，只有 `0x20C2` 且分区数超过 8 的卡会被授予；booter 超时
+才逐级退回。没烧过熔丝的卡拿不到这条路径，仍按 profile 容量表的 CFG1/LMR 配方启动。
+要在一台机器上退回去，装的时候加 `--no-80g`，或者把 `/etc/modprobe.d/cmp-pcie-gen2.conf`
+里的 `CMPEnable80G=1` 删掉（前提是当初的构建没有把它编译掉，见下）。
+无条件保留原有 Gen2 强制路径。`CMPUNLOCKER_EXPERIMENTAL_80G` 默认 1，
+`0`（等同 `--no-80g`）把这条路径整个编译掉并计入构建缓存。10-FBPA 配方只保留作研究，
+不能宣称已修复硬破解卡。
 
 链路重训不再由启动服务承担，`gen2.service` 已从包中移除。Gen1→Gen2 由驱动在 nv.c 的
 init 路径完成（`nv_cmp170hx_retrain_gen2()`：先写 BAR0 的 `CYA_0` 与 `LINK_CONFIG_0`，
@@ -63,10 +66,12 @@ module_blacklist=nvidia,nvidia_drm,nvidia_modeset,nvidia_uvm,nvidia_peermem,nvid
 复制到带时间戳的恢复目录。旧 `/root/cmpunlocker.pre-dynamic.tgz` 仅凭文件名
 不能认定含可用旧模块。安装器曾移除 DKMS，不能靠改名模块目录假装完成回退。
 
-恢复构建保持宿主用户态匹配的 610.57.04 和原内核：
+恢复构建保持宿主用户态匹配的 610.57.04 和原内核，并且不带宽布局（`--no-80g`，等价的
+旧写法是 `CMPUNLOCKER_EXPERIMENTAL_80G=0`）。恢复构建一般也不带 P2P：`--p2p` 会把
+mailbox 路线装回来，而 `--p2p=bar1` 是另一条路线，两者都不该在排查启动问题时顺手加进来：
 
 ```
-sudo env CMPUNLOCKER_DRIVER_VERSION=610.57.04 CMPUNLOCKER_EXPERIMENTAL_80G=0 ./install.sh --p2p --no-iommu --no-passthrough
+sudo env CMPUNLOCKER_DRIVER_VERSION=610.57.04 ./install.sh --no-80g --no-gen4 --no-iommu --no-passthrough
 ```
 
 核对 `modinfo -n nvidia` 与 initramfs 中的 shim/配置。旧安装留下的 `gen2.service`
@@ -107,9 +112,9 @@ CMP SKU 的身份认知，驱动改 `LnkCap` 无效。ECC 计数被补丁清零�
 收口。这条「只有一份」的不变量由 `tests/test_dynfb.py` 检查：E1 的 `CYA_0` 值只允许
 出现在一个载荷里。
 
-总开关是构建时的 `CMPUNLOCKER_EXPERIMENTAL_GEN4=1`（写 `cmp_pcie_gen=0` 并把
-`RMPcieLinkSpeed` 抬到 `0xF`），不设就是把每张卡钉在 Gen2，与本特性加入前
-一致。上机要看的是 `dmesg` 里的 `CMP Gen4: link trained (LnkSta=0x1104)`、
+总开关默认打开（写 `cmp_pcie_gen=0` 并把 `RMPcieLinkSpeed` 抬到 `0xF`），
+`--no-gen4`（等同 `CMPUNLOCKER_EXPERIMENTAL_GEN4=0`）才是把每张卡钉在 Gen2，与本特性
+加入前一致。上机要看的是 `dmesg` 里的 `CMP Gen4: link trained (LnkSta=0x1104)`、
 `CMP Gen3: settled (LnkSta=0x1103)` 与 `falling back to Gen2`，以及 `lspci -vv` 的
 `LnkSta`：`nvidia-smi` 的 `pcie.link.gen.max` 只是 GSP 的身份认知（抬到 `0xF` 后它
 确实会随着变成 4，但判链路仍以 `LnkSta`/sysfs 为准）。

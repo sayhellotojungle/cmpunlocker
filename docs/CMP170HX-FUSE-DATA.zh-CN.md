@@ -183,16 +183,20 @@ eval 的时机。那一次 stage 本来就是 64g，`burned` 没参与决策，�
 
 ## 运行时开关（无需重编即可回退）
 
-`build.sh` 在 `CMPUNLOCKER_EXPERIMENTAL_80G=1` 时往 `RegistryDwords` 里加 `CMPEnable80G=1`：
+`build.sh` 在 `CMPUNLOCKER_EXPERIMENTAL_80G` 为 1（默认，等同不带 `--no-80g` 的安装）时
+往 `RegistryDwords` 里加 `CMPEnable80G=1`：
 
 ```
-options nvidia NVreg_EnableResizableBar=1 \
+options nvidia cmp_pcie_gen=0 NVreg_EnableResizableBar=1 \
   NVreg_RegistryDwords="...;CMPEnable80G=1;RMForceStaticBar1=1;RMPcieP2PType=1"
 ```
 
 驱动里 `_kgspCmpDynGeomEval()` 读不到这个键就直接把 stage 定为 `CMP_DYN_STAGE_64G`
 （即已验证的 64 GiB 布局，`CFG1=0x02779000 LMR=0x0000020b`，静态 BAR1 与 P2P 保留）。
-删掉该键 + `update-initramfs -u` + 重启即可回到 64 GiB，不必重新编译驱动。
+删掉该键 + `update-initramfs -u` + 重启即可回到 64 GiB，不必重新编译驱动 —— 前提是当初
+的构建编译了这条路径。用 `--no-80g`（或 `CMPUNLOCKER_EXPERIMENTAL_80G=0`）装的构建把
+路径整个编译掉了（`CMP_DYN_ENABLE_80G` 为 0，烧写判据恒为假），那种情况下补这个键没有
+作用，必须重新安装。
 
 ## 验收
 

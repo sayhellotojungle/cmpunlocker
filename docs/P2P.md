@@ -13,8 +13,8 @@ the other, never both.
 ## Enable or disable
 
 ```bash
-sudo ./install.sh --p2p=bar1        # or --p2p, which means the same
-sudo ./install.sh --p2p=mailbox
+sudo ./install.sh --p2p=bar1        # the BAR1 route, asked for by name
+sudo ./install.sh --p2p=mailbox     # or --p2p, which means this
 # Existing flags can be combined with the choice:
 sudo ./install.sh --p2p=mailbox --profile=10gb --no-passthrough
 ```
@@ -26,16 +26,24 @@ Direct builds use the same interface:
 sudo env CMPUNLOCKER_ENABLE_P2P=mailbox ./driver/build.sh
 ```
 
-Accepted values are `off` (also `0`, the empty string, and unset), `bar1` (also `1`,
-the spelling `--p2p` has always meant) and `mailbox`. Anything else is rejected before
-anything is built. The installer uses its command-line flag as the authority: without
-`--p2p`, P2P is disabled even if the calling shell exports the environment variable.
+Accepted values are `off` (also `0`, the empty string, and unset), `mailbox` (also `1`,
+which says yes without naming a route, and the default route is the mailbox) and `bar1`.
+Anything else is rejected before anything is built. The installer uses its command-line
+flag as the authority: without `--p2p`, P2P is disabled even if the calling shell exports
+the environment variable.
 
-`bar1` is the route that was verified first and it is the one that needs a large BAR1;
-`mailbox` is the route that works without one, and it is the one that has been run on
-the two 80 GiB cards here, at Gen4, with the bytes checked (`tools/p2p-content-check.py`
-passing on both ordered pairs). Read "The mailbox route" before choosing it, and read
-"Verify real transfers" before believing either one.
+`mailbox` is the default route because it is the one that asks nothing of the host's MMIO
+map, and the only one a card on the wide layout can use: it needs 64 KiB per peer and no
+BAR1 mapping of the framebuffer, and a card on the wide
+layout has no BAR1 that covers its own memory. It is also the route that has been run on
+the two 80 GiB cards here, at Gen4, with the bytes checked
+(`tools/p2p-content-check.py` passing on both ordered pairs). `bar1` is the older route
+and the one that needs a large BAR1 and enough Above-4G MMIO from the host; it is still
+what GPUDirect Storage's native p2pdma mode needs, so it is asked for by name. Where a
+card's trap cannot be armed, that card reports P2P unsupported on this route rather than
+moving garbage, which is the one way in which the default route is the more conservative
+of the two. Read "The mailbox route" before choosing it, and read "Verify real transfers"
+before believing either one.
 
 ## The BAR1 route (`--p2p=bar1`)
 
@@ -43,23 +51,23 @@ For this build, `/etc/modprobe.d/cmp-pcie-gen2.conf` contains one combined
 `NVreg_RegistryDwords` value:
 
 ```text
-RmForceEnableGen2=1;RMPcieLinkSpeed=0x1;RmForceDisableIomapWC=1;RMForceStaticBar1=1;RMPcieP2PType=1
+RmForceEnableGen2=1;RMPcieLinkSpeed=0xF;RmForceDisableIomapWC=1;RMForceStaticBar1=1;RMPcieP2PType=1;CMPEnable80G=1
 ```
 
-`RMPcieLinkSpeed=0x1` is the GDS/P2PDMA-validated baseline: RM is not allowed to
-request link speeds above Gen2. Leaving the key unset is not equivalent — RM
-then fails `SET_PCIE_SPEED` with `NV_ERR_NOT_SUPPORTED`. `CMPUNLOCKER_EXPERIMENTAL_GEN4=1`
-raises it to `0xF` and adds the module parameter `cmp_pcie_gen=0`, which is the
-only case in which the value is raised: the Gen3 -> E1 DevInit replay -> Gen4
-sequence in `driver/dynfb/hooks/` is what actually initializes the PHY, per card,
-from that card's own PCIe speed fuses, and `0xF` on its own would let RM ask for
-a speed the link cannot train. The module also receives
-`NVreg_EnableResizableBar=1`. Automatic fuse-based PCIe bypass was removed
-after a regression, and experimental 80 GiB geometry is off by default. A card
-that takes the 80 GiB layout has `RMForceStaticBar1` downgraded to AUTO by the
-driver, and with it BAR1 P2P; the reason and the numbers are in
+`RMPcieLinkSpeed` is a maximum-speed allow-mask, and `0xF` is what a default install
+writes: it lets a card ask for what its own fuses allow, and the Gen3 -> E1 DevInit
+replay -> Gen4 sequence in `driver/dynfb/hooks/` is what actually initializes the PHY,
+per card, from that card's own PCIe speed fuses. Leaving the key unset is not equivalent —
+RM then fails `SET_PCIE_SPEED` with `NV_ERR_NOT_SUPPORTED` — and `0xF` on its own would
+let RM ask for a speed the link cannot train, which is why the mask and the per-card
+bring-up travel together. `--no-gen4` writes `0x1` instead, the value the GDS/P2PDMA
+baseline was validated with: RM is then not allowed above Gen2 on any card. The module
+also receives `NVreg_EnableResizableBar=1`, and `cmp_pcie_gen=0` unless `--no-gen4` left
+it out. Automatic fuse-based PCIe bypass was removed after a regression. The wide layout
+is on by default, so a card that takes the 80 GiB layout has `RMForceStaticBar1`
+downgraded to AUTO by the driver, and with it BAR1 P2P; the reason and the numbers are in
 "BAR1 size and the 80 GiB layout" below. Cards on the 64 GiB layout keep static
-BAR1.
+BAR1, and `--no-80g` keeps every card there.
 
 A `mailbox` build writes the opposite keys — `RMPcieP2PType` stays at its default
 (`NV_REG_STR_RM_PCIEP2P_TYPE_DEFAULT` is `MAILBOX`) and `RMForceStaticBar1` stays

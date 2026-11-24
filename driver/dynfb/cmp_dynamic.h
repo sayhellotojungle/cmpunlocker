@@ -40,8 +40,10 @@
 #define CMP_DYN_80G_LMR          0x0000028BU  /* ten partitions of eight GiB      */
 #define CMP_DYN_MAX_GPU          32U
 
-// Compiled in by default, asked for per card: build.sh rewrites this switch from
-// CMPUNLOCKER_EXPERIMENTAL_80G and only then adds CMPEnable80G to RegistryDwords.
+// On by default, granted per card: build.sh rewrites this switch from
+// CMPUNLOCKER_EXPERIMENTAL_80G (default 1) and only then adds CMPEnable80G to
+// RegistryDwords, so a --no-80g build has neither the compiled path nor the key, and a
+// default build can be talked out of the wide layout by removing the key alone.
 #define CMP_DYN_ENABLE_80G       1
 #define CMP_DYN_REG_ENABLE_80G   "CMPEnable80G"
 #define CMP_DYN_REG_STAGE        "CMPDynStage"
@@ -183,11 +185,13 @@ _kgspCmpDynGeomEval(OBJGPU *pGpu)
         pState->bSeen = 1U;
         pState->stage = CMP_DYN_STAGE_80G;
 
-        // Opt-in twice over: RegistryDwords asks for the wide layout, and a layout
-        // an earlier attempt already gave up on stays given up on, so that a card
-        // that cannot boot wide does not try again on every init.  Without the key
-        // the card keeps the geometry it is known to boot from, which makes the
-        // experiment a modprobe-config edit rather than a driver rebuild.
+        // Two conditions, not one: RegistryDwords has to ask for the wide layout, and a
+        // layout an earlier attempt already gave up on stays given up on, so that a card
+        // that cannot boot wide does not try again on every init.  Without the key the
+        // card keeps the geometry it is known to boot from, which is why backing a
+        // single machine out can be a modprobe-config edit rather than a driver rebuild
+        // — as long as the build left the path compiled in, which it does unless it was
+        // installed with --no-80g.
         if ((osReadRegistryDword(pGpu, CMP_DYN_REG_ENABLE_80G, &value) != NV_OK) ||
             (value == 0U))
         {
