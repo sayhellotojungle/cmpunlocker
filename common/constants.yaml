@@ -74,6 +74,12 @@ unlocks:
       feat:           { addr: "0x00823804", value: "0xffffffff" }
       feat2:          { addr: "0x00823b00", value: "0xffffffff" }
       fbpa_plm:       { addr: "0x009a0148", value: "0xffffffff" }
+      # These two are in the same table but not in every build: the booter opens
+      # them only when RegistryDwords carries CMPEnableHbmPm=1, because the only
+      # thing that writes through them is the HBM governor below, and a machine
+      # that does not run it has no reason to widen the block they guard.
+      fbpa_cfg_plm:   { addr: "0x009a0168", value: "0xffffffff" }
+      hbm_pll_plm:    { addr: "0x009a3c7c", value: "0xffffffff" }
 
   # The mailbox P2P path needs one mask the others do not: the privilege level of
   # the PRI decode trap that lets the closed GSP-RM touch the NV_P2P block at all.
@@ -100,6 +106,147 @@ unlocks:
       ltc_lmr:   { addr: "0x00100ce0" }
       wpr2_lo:   { addr: "0x001fa824" }
       wpr2_hi:   { addr: "0x001fa828" }
+
+  # Everything above this line happens once, during GSP bootstrap.  HBM idle power
+  # cannot: the clock has to come back up the moment the framebuffer is touched
+  # again, which is a decision only a running system can make, so it is a module
+  # (driver/hbm-pm) that borrows the counters GSP-RM already arms and moves the
+  # memory PLL itself.  The two masks that make those writes legal are declared
+  # under privilege_masks, in the patch that opens them; what is declared here is
+  # what the module writes.
+  hbm_pm:
+    source: hbm-pm/cmp_hbm_pm.c
+    registers:
+      fbpa_base:          { addr: "0x00900000" }
+      fbpa_stride:        { addr: "0x00004000" }
+      fbpa_cfg1:          { addr: "0x00000204" }
+      fbpa_refresh_plm:   { addr: "0x00000168" }
+      fbpa_refresh:       { addr: "0x000002a0" }
+      fbpa_software_ref:  { addr: "0x00000310" }
+      hbm_pll_plm:        { addr: "0x00003c7c" }
+      hbm_pll_cfg:        { addr: "0x00003c90" }
+      hbm_pll_coeff:      { addr: "0x00003c98" }
+      # The serial-priv aperture is the only legal way in: writing the PLL through
+      # the window above, outside the fence that guards this one, is how a memory
+      # clock change loses the trained delay lines.
+      hbm_pll_cfg_mc2:    { addr: "0x0098bc90" }
+      hbm_pll_coeff_mc2:  { addr: "0x0098bc98" }
+      pri_fence:          { addr: "0x001211fc" }
+      fb_stop_output:     { addr: "0x0010a7c0" }
+      fb_stop_input:      { addr: "0x0010a7c4" }
+      fb_stop_set:        { addr: "0x0010a7e0" }
+      fb_stop_clear:      { addr: "0x0010a7e4" }
+      # The counters are read, never armed: whichever ones GSP-RM runs are the
+      # ones the governor trusts, and it trusts them only while the five words
+      # describing each one stay the same across the read of its count.
+      pmu_count:          { addr: "0x0010bf80" }
+      pmu_counter_mask_0: { addr: "0x0010be40" }
+      pmu_counter_mask_1: { addr: "0x0010be80" }
+      pmu_counter_mask_2: { addr: "0x0010bec0" }
+      pmu_counter_control: { addr: "0x0010bfc0" }
+      pmu_counter_threshold: { addr: "0x0010be00" }
+      gfw_boot:           { addr: "0x00118234" }
+      gsp_riscv_status:   { addr: "0x00111240" }
+      # Not a register: the BAR0 window the VBIOS container is read out of.  The
+      # governor reads it and never writes it, and it is where the claim this feature
+      # is built on -- that the card has one performance level -- can be checked
+      # against the table instead of against what nvidia-smi prints.
+      prom_window:        { addr: "0x00300000" }
+    # The lease the governor waits for before it takes a card's framebuffer away.
+    # These are not in the module because nothing in the module can answer the
+    # question they are about: the borrowed activity counters were measured reading
+    # zero for 8.4 s on a card serving requests at 178 W, and this chip's register
+    # headers contain no engine-busy status at all, so the utilisation, the power
+    # and the client list have to be asked of RM, from userspace, by
+    # tools/hbm-lease.py.  Removing this block does not make the feature looser: it
+    # makes the keeper refuse to run, which leaves every card on its busy clock.
+    keeper:
+      source: tools/hbm-lease.py
+      # How often the keeper asks RM, and how many consecutive answers have to
+      # agree.  Three rounds at one second is what a request that began just after
+      # a sample costs before it is seen: anything less than two is a single
+      # sample being treated as evidence, and the module insists on the same thing
+      # again from its side (CMP_HBM_LEASE_MIN_REPORTS).  For a rule that lets a
+      # held card through, this is the field that does the work: one round sampled
+      # before a request existed got through at window 3, and the same round could
+      # not have lowered anything at window 12, because twelve of them have to agree
+      # and the next round of that burst said busy.  What that buys is measured too
+      # -- the first quiet verdict after traffic stopped came 3.3 s later at window 3
+      # and 12.4 s later at window 12 -- and what it buys is watts, not safety.
+      interval_s:         "1"
+      window:             "3"
+      # Utilisation is the honest signal and the floor is therefore zero: NVML
+      # reported 100% on the card whose counters were silent, so anything above
+      # zero is somebody's work.  Measured again across 24 requests with a serving
+      # framework resident: 87 to 96% while one was in flight, 0% in every quiet
+      # round, and 1% often enough to refuse a card twelve times over.  A card
+      # drawing under this much power is not computing; 70 W is the margin above the
+      # 56.94 to 59.01 W that the busiest measured at-rest state has shown here, and
+      # it is a second opinion, not the gate.  It is worth knowing exactly how much
+      # second opinion it is before this number is moved: the one reading that shows a
+      # held card being harmed -- its worker hung, its peer still reading its memory,
+      # 0% utilisation at 61 to 67 W for 98.6 s -- sits about 2 W above a resident card
+      # at rest.  Under the shipped rule the client list refused that card so the
+      # floor never had to decide; a rule that lets it through would be deciding on
+      # 2 W of margin, which is why this floor is not the reason to relax the line below.
+      util_floor_pct:     "0"
+      power_floor_mw:     "70000"
+      # Whether a card may come down while another card on the same box is working.
+      # `y`, and it is the cross-card half of the rule rather than a second opinion:
+      # the one reading this feature has of a held card being harmed while its own
+      # answers said idle -- 0% utilisation at 61 to 67 W for 98.6 s, its neighbour
+      # still streaming through its memory -- is a state no floor on the harmed card
+      # can tell from a card at rest, because the traffic in it belongs to the other
+      # card and the harmed card's borrowed counters stayed silent throughout. The
+      # cost is the deployment where two cards serve unrelated work: the idle one
+      # waits for the busy one, and gets its 14 W later or not at all. Turn it off
+      # only on a box whose cards do not read each other's memory.
+      peer_veto:          "y"
+      # Whether a process holding the card is itself the refusal.  This is the switch
+      # for the resident case, and it is now `n`: the card whose serving framework is
+      # resident is judged on what it is doing rather than on being held.
+      #
+      # What it delivers is the same size as the empty card's saving, on a card somebody
+      # holds: at 98 % dwell over 40 s it read 37.3 and 35.9 W where the same card at its
+      # busy clock read 51.2 and 49.5 W, `errors 0` and uncorrected ECC unmoved, with a
+      # request that arrived at the lowered card answered in 3.36 to 4.29 s against 3.26
+      # and 4.23 s up-clock and the governor raising the card again in 26 to 49 ms.
+      #
+      # What it costs if it is wrong, measured rather than argued: the worst case is a
+      # request served at the idle memory clock from beginning to end, which took 6.238 s
+      # against 3.199 s, came back HTTP 200, and left the ECC counts where they were.  It
+      # is not a frozen card, because the framebuffer stop is asserted and released inside
+      # one transition and a card at the idle clock has its request path running.  The
+      # counters see the onset of work dependably -- the smallest movement any request has
+      # ever produced on this hardware was 81981 events, from an eight-token completion --
+      # and they have also been recorded stalling for seconds on a saturated card, which
+      # is why utilisation is the second net and not the first.
+      #
+      # Two readings this key does NOT rest on, both in docs/HBM-PM.md: utilisation is the
+      # only discriminator that worked (87 to 96% serving, 0% in every quiet round, and 1%
+      # often enough to refuse on its own), and power is not one at these levels -- the
+      # card being served drew the same 56 to 57 W as the same card doing nothing, so the
+      # floor above is a backstop and not the gate.
+      clients_veto:       "n"
+      # The counter floor the relaxed rule is armed with, by the keeper itself, at the
+      # same moment it relaxes the client list: see ensure_wake_floor() in
+      # tools/hbm-lease.py, which puts the strict rule back if the governor will not take
+      # the floor.  The two settings are one setting because the noise the floor has to
+      # clear is the keeper's own -- three NVML calls a round, each an RPC into GSP-RM,
+      # measured at 517 to 545 events a sample on a card doing nothing at all, which at a
+      # floor of 512 changed state 33 times in 45 s and saved a third of the watts.
+      # 8192 is fifteen times that noisiest round and a tenth of the smallest movement a
+      # request has made (81981 events), so it sits between two measurements rather than
+      # being tuned.  The governor refuses a floor at or above 1<<20 outright.
+      resident_wake_events: "8192"
+      # What one round of asking costs, which is why this is not a tuning knob: three
+      # NVML calls per card per round, every one of them an RPC into GSP-RM, which
+      # serialises them against the same path a workload's launches take.  Running a
+      # second keeper at 0.2 s beside this one -- six rounds a second, thirty calls a
+      # second, on a box serving with two cards -- was followed within a minute by a
+      # tensor-parallel worker that stopped reporting and an engine that gave up four
+      # minutes later.  The shipped rate is what has been observed harmless here; do
+      # not raise it on a machine somebody is using, and never run two keepers.
 
   pcie_gen2:
     patch: pcie-gen2.patch

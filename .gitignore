@@ -40,3 +40,16 @@ driver/.build/
 logs/
 .p2p-test-*/
 *.tar.gz
+
+# The companion modules are built where they live, by tools/passthrough-setup.sh and
+# tools/hbm-pm-setup.sh, so a kernel module build leaves its output next to the .c.
+*.o
+*.o.d
+*.ko
+*.mod
+*.mod.c
+.*.cmd
+Module.symvers
+modules.order
+modules.builtin
+modules.builtin.modinfo

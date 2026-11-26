@@ -45,6 +45,25 @@ def dynfb():
     return module
 
 
+def keeper():
+    """tools/hbm-lease.py as a module.
+
+    Importing it, rather than reading it as text, is what lets the bus-id decoding
+    be tested against the byte layout NVML actually returned on the bench: a struct
+    field that goes missing is a card named from somebody else's bytes, and no
+    amount of matching strings in the source can see that happen.  Nothing here
+    touches libnvidia-ml: the library is opened in Nvml.__init__, and the tests
+    below only build NvmlPciInfo values and call methods that read them.
+    """
+    import importlib.util
+
+    path = ROOT / "tools" / "hbm-lease.py"
+    spec = importlib.util.spec_from_file_location("hbm_lease", str(path))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _bash_array(name):
     """A bash array literal in driver/build.sh, either written form."""
     text = (ROOT / "driver" / "build.sh").read_text()

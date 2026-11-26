@@ -1,0 +1,37 @@
+# /etc/systemd/system/cmp-hbm-lease.service -- written by tools/hbm-pm-setup.sh
+#
+# What this is for: cmp_hbm_pm.ko will not lower a card's HBM clock until somebody
+# tells it the card is unclaimed, and the kernel is not that somebody.  The module
+# can see borrowed activity counters, and those were measured reading zero for
+# 8.4 s on a card serving requests at 178 W; this service is the part that asks
+# the driver instead, once a second, and writes the answer to
+# /sys/kernel/cmp_hbm_pm/lease.
+#
+# What it means when this is not running: every card stays on its busy clock. That
+# is the safe direction, and it is the whole reason the lease is a lease -- a
+# stopped keeper costs watts, not a card.
+#
+# Restart=always with RestartSec=5 covers the module being loaded later than this
+# starts, and the box coming up without the driver ready: the keeper exits 75
+# (EX_TEMPFAIL) when the lease file is not there, and systemd tries again.
+[Unit]
+Description=cmpunlocker: tell the HBM governor which cards nobody is using
+Documentation=file:///usr/local/share/doc/cmpunlocker/HBM-PM.md
+After=nvidia-persistenced.service
+
+[Service]
+Type=simple
+# --constants is written out by tools/hbm-pm-setup.sh (sed over @CONSTANTS@) rather
+# than being a fixed path: the keeper reads its floors from the same
+# common/constants.yaml everything else in this project reads, and that file lives
+# in the tree the installer was run from, not next to the installed script.
+ExecStart=/usr/bin/python3 /usr/local/lib/cmpunlocker/hbm-lease.py --loop --constants @CONSTANTS@
+Restart=always
+RestartSec=5
+# It asks a question and writes one line per card.  If that ever needs more than
+# this, the answer it is giving is the one to be suspicious of.
+CPUWeight=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

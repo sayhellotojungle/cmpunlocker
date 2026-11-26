@@ -1,14 +1,35 @@
 ## About this project
 
-This project unlocks NVIDIA CMP 170HX / A16 memory beyond the capacity the SKU reports
-and brings the PCIe link up to Gen4 on hardware-unlocked cards; both are on in a plain
-install. GPU-to-GPU P2P over BAR1 or over RM's write mailbox is the one part still behind
+This project unlocks NVIDIA CMP 170HX / A16 memory beyond the capacity the SKU reports,
+brings the PCIe link up to Gen4 on hardware-unlocked cards, and takes the HBM refresh
+current off the bill while a card is not working; all three are on in a plain install.
+GPU-to-GPU P2P over BAR1 or over RM's write mailbox is the one part still behind
 a flag. It is delivered as a set of patches applied to a stock
 `open-gpu-kernel-modules` release, with an installer, a verification
 script and an uninstaller.
 
 Implemented functions:
 
+- **Idle HBM power management, on by default.** A CMP 170HX carries a single performance level in
+  its VBIOS, so nothing ever asks the memory PLL to come down and an idle card pays full HBM2E
+  refresh current forever: 45.46 W and 43.20 W on the two cards of the bench machine. A companion
+  module, `cmp_hbm_pm.ko`, takes the memory from 1728 MHz to 540 MHz while the card is provably
+  not working, using the stop-the-framebuffer sequence the firmware uses for the same job —
+  31.70 W and 29.55 W at rest, about 27 W for the pair — and the same size of saving again on the
+  case a serving box actually lives in, where a framework holds the card allocated and asks nothing
+  of it: 51.2 W and 49.5 W become 37.3 W and 35.9 W. The way back is taken on the first sample that
+  sees traffic and costs 1.6 to 2.1 ms, which a client does not notice. The ceiling on what being
+  wrong about a card costs was measured rather than argued: a 1500-token request served end to end
+  with the memory pinned at the idle clock took 6.238 s against 3.199 s, HTTP 200, ECC unmoved — a
+  card at the idle clock has slow memory, not no memory. What authorises the drop is not the
+  activity counters, which only ever veto and have been seen report nothing at all for eight
+  seconds on a card drawing 178 W: it is a lease written by `tools/hbm-lease.py` from what the
+  driver itself says about clients, utilisation and power, refreshed every second, with a busy
+  neighbour holding a card busy. `--no-hbm-pm` leaves the feature out of the build entirely, and
+  `systemctl stop cmp-hbm-lease.service` returns every card to its busy clock as soon as its lease
+  goes stale three seconds later. It is a port and extension of the idle HBM governor from
+  [`gpu-unlock 3.0.0-beta`](https://github.com/Zagitta/gpu-unlock/tree/3.0.0-beta); every number
+  above is in [Idle HBM power](docs/HBM-PM.md), with the run that produced it.
 - **GPU-to-GPU P2P.** Optional, off by default, enabled with `--p2p=bar1` or
   `--p2p=mailbox`; a bare `--p2p` takes the mailbox route, the one that needs no large
   BAR1 and the only one open to a card on the wide layout.
@@ -116,6 +137,7 @@ command for a box of mixed cards:
 | Memory unlock from the profile table (64 GiB on `10de:20c2`, 40 GiB on `10de:2082`) | `--profile=` |
 | The wide (80 GiB) layout, for a card whose framebuffer fuses were burned | `--no-80g` |
 | The PCIe speed each card's own fuses allow (Gen4 on a burned card, Gen2 on a soft card) | `--no-gen4` |
+| An idle card's HBM clock, lowered by `cmp_hbm_pm` and restored the moment the framebuffer is touched | `--no-hbm-pm` |
 | ECC on DRAM and SRAM, and the full SM count | nothing to back out |
 | VM passthrough preparation | `--no-passthrough` |
 | IOMMU kernel parameters (`intel_iommu=on`/`amd_iommu=on` plus `iommu=pt`) | `--no-iommu` |
@@ -388,6 +410,49 @@ into the tree and the hooks that call it are placed **by anchor**, not by a cont
 window, so a driver release that moves code costs a line number instead of a hunk
 that applies "with fuzz" and lands in the wrong function. A hook whose anchor is
 missing or ambiguous fails the build and says which one.
+
+### Idle HBM power
+
+Everything in the section above is decided once, while the card is coming up, and never
+revisited. Idle power cannot be: the memory clock has to come back up the moment the
+framebuffer is touched again, which is a decision only a running system can make, so this
+one is a module — and it is a module with a helper, because the one question it cannot ask
+from kernel space is whether anything owns the card. The patched driver opens the FBPA
+refresh block and the memory PLL during GSP bootstrap — on request, through `CMPEnableHbmPm=1`
+in the same `RegistryDwords` the wide layout asks through — and `cmp_hbm_pm.ko` borrows the
+activity counters GSP-RM already has armed and moves the memory PLL itself, using the
+stop-the-framebuffer sequence the firmware uses for the same job, with the way back taken on
+the first sample that sees traffic. Counters only ever veto. Movement in any of them means the
+card is working, and silence proves nothing: the borrowed pair has been recorded reporting
+`active 0x0` for eight seconds on a card drawing 178 W at 100 % utilisation, and one of them also
+ticks while nobody uses it. The permission therefore comes from userspace:
+`tools/hbm-lease.py` asks the driver once a second which cards have no client attached, writes the
+answer to `/sys/kernel/cmp_hbm_pm/lease`, and a card comes down only while that lease is fresh —
+and stays down only while it is re-answered, not on the strength of the answer that brought it
+down. A keeper that is not running costs watts, never a card; the status file's `lease none`, or a
+verdict marked `stale`, is what distinguishes that from an idle machine.
+
+```bash
+cat /sys/kernel/cmp_hbm_pm/status        # per card: busy, idle, or mid-transition
+cat /sys/kernel/cmp_hbm_pm/perf_table    # what the card's VBIOS offers: read-only
+```
+
+The second one is a decoder rather than a knob: it copies the VBIOS container out of the
+PROM window and prints the performance table the card actually carries, which is where the
+claim behind the whole feature — one performance level — comes from, and why a generated idle
+state is not on the menu here. The memory clock sequence and that table layout both come from
+[`gpu-unlock 3.0.0-beta`](https://github.com/Zagitta/gpu-unlock/tree/3.0.0-beta), which this
+repository ports and extends; [Idle HBM power](docs/HBM-PM.md) says what was ported, what was
+changed, and what was measured after the port.
+
+`--no-hbm-pm` (or `CMPUNLOCKER_HBM_PM=0`) leaves the key out of the build and the module
+uninstalled, and either one alone is enough to leave a card alone: the governor reads one
+word, reports `refresh access closed`, and the card goes on keeping the clock it has always
+kept. What it saves — 13.8 W and 13.7 W on the two cards of the bench card, about 27 W for the
+pair, with the keeper's answer being the only thing that authorised the switch, and the same size
+of saving again on a card whose serving framework is resident and idle, where it reads 37.3 W and
+35.9 W instead of 51.2 W and 49.5 W — what one transition costs, the ten runtime knobs and the
+reasons it declines to switch are in [Idle HBM power](docs/HBM-PM.md).
 
 ### What is and is not tied to a driver release
 

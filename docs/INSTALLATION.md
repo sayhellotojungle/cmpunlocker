@@ -43,13 +43,17 @@ it already reports:
 | Memory unlock | 64 GB on an 8 GB card, 40 GB on a 10 GB card, from the profile table | `--profile=` |
 | Wide (80 GiB) layout | A card whose framebuffer fuses were burned reports the hidden FBP pair and is sized from its own `CFG1`/`LMR`. A card that cannot boot it steps back one layout. | `--no-80g` |
 | Fused PCIe speed | Each card is asked for the speed its own speed fuses allow, so a burned card trains Gen4 and a soft-unlocked card stays at Gen2 | `--no-gen4` |
+| Idle HBM power | `cmp_hbm_pm` watches the activity counters GSP-RM already keeps armed and lowers an idle card's memory clock, back up the moment the framebuffer is touched. The only feature still running after boot, and the only one that is a module rather than a patch | `--no-hbm-pm` |
 | ECC (DRAM and SRAM), full SM count | Part of the base patch set | nothing to turn off |
 | VM passthrough setup | The unlock survives being handed to `vfio-pci` | `--no-passthrough` |
 | IOMMU kernel parameters | `intel_iommu=on`/`amd_iommu=on` plus `iommu=pt` | `--no-iommu` |
 
 GPU-to-GPU P2P is the one feature still behind a flag, and the only one that asks you to
 choose a route: it needs host setup on top of the driver, and a capability report on a
-machine where nothing actually moves looks exactly like success.
+machine where nothing actually moves looks exactly like success. Idle HBM power is the other
+one worth reading before you trust a meter to say anything, because it is the one feature
+that is a running policy rather than a change to what the card reports:
+[Idle HBM power](HBM-PM.md).
 
 ## Optional P2P
 

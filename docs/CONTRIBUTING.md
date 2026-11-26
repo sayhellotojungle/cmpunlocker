@@ -30,3 +30,4 @@ Thanks for your interest in contributing to cmpunlocker! This guide covers submi
 - **Minimize the diff**: cmpunlocker should be as light as possible in terms of size.
 - **Comments**: Please add comments as little as you can.
 - **Testing**: Always test on physical hardware before submitting. Describe your test environment (distro, kernel version, card variant).
+- **Measurements**: describe the card, the kernel and the driver version, and leave out the machine. A bench address, an account name or a token in a doc is a fact about someone's network rather than about a card, and it is permanent the moment it is pushed. `tests/test_privacy.py` checks the shapes, so "it was only my LAN IP" is not a thing a reviewer has to catch by eye.

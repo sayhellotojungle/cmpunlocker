@@ -66,7 +66,7 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
  
      {
          // If the new FB layout requires a scrubber ucode to scrub additional space, prepare it now
-@@ -4821,6 +4857,154 @@
+@@ -4821,6 +4857,183 @@
      // Setup arguments for bootstrapping GSP
      NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, kgspPrepareForBootstrap_HAL(pGpu, pKernelGsp, KGSP_BOOT_MODE_NORMAL));
  
@@ -100,6 +100,8 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
 +            { 0x008200d8U, 0xffffffffU, "RECONFIG_PLM" },
 +            { 0x0000c840U, 0xffffffffU, "PJTAG_PLM" },
 +            { 0x0000c848U, 0xffffffffU, "PJTAG_SEC_PLM" },
++            { 0x009a0168U, 0xffffffffU, "FBPA_CFG_PLM" },
++            { 0x009a3c7cU, 0xffffffffU, "HBMPLL_PLM" },
 +        };
 +
 +        NvU32 wpr2Lo = GPU_REG_RD32(pGpu, 0x001fa824U);
@@ -108,8 +110,32 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
 +                  "SEC2_DEBUG: saved WPR2 lo=0x%08x hi=0x%08x\n",
 +                  wpr2Lo, wpr2Hi);
 +
-+        for (plmIdx = 0; plmIdx < 12; plmIdx++)
++        for (plmIdx = 0; plmIdx < sizeof(plmTable) / sizeof(plmTable[0]); plmIdx++)
 +        {
++            /*
++             * The last two rows are the blocks cmp_hbm_pm.ko writes at run
++             * time to move an idle card's HBM down: the FBPA window holding
++             * the refresh interval, and the memory PLL behind its own mask.
++             * Nothing else in the driver touches either, so they are opened
++             * only when RegistryDwords carries CMPEnableHbmPm=1, which is
++             * what driver/build.sh writes for the governor; a machine that
++             * does not run it never asked the booter to widen them.
++             */
++            if (plmTable[plmIdx].addr == 0x009a0168U ||
++                plmTable[plmIdx].addr == 0x009a3c7cU)
++            {
++                NvU32 cmpHbmPm = 0;
++
++                (void) osReadRegistryDword(pGpu, "CMPEnableHbmPm", &cmpHbmPm);
++                if (cmpHbmPm != 1)
++                {
++                    NV_PRINTF(LEVEL_ERROR,
++                              "SEC2_DEBUG: HBM PM masks left closed "
++                              "(CMPEnableHbmPm not set)\n");
++                    continue;
++                }
++            }
++
 +            NvBool opened = NV_FALSE;
 +            for (attempt = 0; attempt < 2 && !opened; attempt++)
 +            {
@@ -143,11 +169,14 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
 +        GPU_REG_WR32(pGpu, 0x001fa828U, wpr2Hi);
 +
 +        NV_PRINTF(LEVEL_ERROR,
-+                  "SEC2_DEBUG: PLMs: FEAT=0x%08x FBPA=0x%08x WPR=0x%08x WPR_CFG=0x%08x\n",
++                  "SEC2_DEBUG: PLMs: FEAT=0x%08x FBPA=0x%08x WPR=0x%08x WPR_CFG=0x%08x "
++                  "FBPA_CFG=0x%08x HBMPLL=0x%08x\n",
 +                  GPU_REG_RD32(pGpu, 0x00823804U),
 +                  GPU_REG_RD32(pGpu, 0x009a0148U),
 +                  GPU_REG_RD32(pGpu, 0x001fa7c4U),
-+                  GPU_REG_RD32(pGpu, 0x001fa7ccU));
++                  GPU_REG_RD32(pGpu, 0x001fa7ccU),
++                  GPU_REG_RD32(pGpu, 0x009a0168U),
++                  GPU_REG_RD32(pGpu, 0x009a3c7cU));
 +
 +        {
 +            NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
@@ -221,7 +250,7 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
      // Release the API lock if relaxed locking for parallel init is enabled
      NvBool bRelaxedLocking = _kgspShouldRelaxGspInitLocking(pGpu);
      if (bRelaxedLocking)
-@@ -5662,6 +5815,96 @@
+@@ -5662,6 +5875,96 @@
      pKernelGsp->gspRmBootUcodeSize   = 0;
  }
  
@@ -318,7 +347,7 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
  static NV_STATUS
  _kgspCreateSignatureMemdesc
  (
-@@ -5672,6 +5903,9 @@
+@@ -5672,6 +5975,9 @@
  {
      NV_STATUS status = NV_OK;
      NvU8 *pSignatureVa = NULL;
@@ -328,7 +357,7 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
      NvU64 flags = MEMDESC_FLAGS_NONE;
  
      if (confComputeForceUnprotAlloc(pGpu))
-@@ -5682,7 +5916,7 @@
+@@ -5682,7 +5988,7 @@
      // NOTE: align to 256 because that's the alignment needed for Booter DMA
      NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
          memdescCreate(&pKernelGsp->pSignatureMemdesc, pGpu,
@@ -337,7 +366,7 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
              NV_TRUE, ADDR_SYSMEM, NV_MEMORY_CACHED, flags));
  
      memdescTagAlloc(status,
-@@ -5694,8 +5928,48 @@
+@@ -5694,8 +6000,48 @@
          (pSignatureVa != NULL) ? NV_OK : NV_ERR_INSUFFICIENT_RESOURCES,
          fail_alloc);
  
@@ -388,7 +417,7 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
  
      memdescUnmapInternal(pGpu, pKernelGsp->pSignatureMemdesc, 0);
      pSignatureVa = NULL;
-@@ -5709,6 +5983,69 @@
+@@ -5709,6 +6055,69 @@
      memdescDestroy(pKernelGsp->pSignatureMemdesc);
      pKernelGsp->pSignatureMemdesc = NULL;
  
@@ -458,7 +487,7 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
      return status;
  }
  
-@@ -6612,6 +6949,51 @@
+@@ -6612,6 +7021,51 @@
  {
      GspStaticConfigInfo *pGSCI = GPU_GET_GSP_STATIC_INFO(pGpu);
  

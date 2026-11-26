@@ -86,13 +86,23 @@ elif name == "patch":
     if os.environ.get("FAIL_PATCH") and os.environ["FAIL_PATCH"] in payload:
         sys.exit(1)
 elif name == "make":
-    out = pathlib.Path.cwd() / "kernel-open/nvidia.ko"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    # The feature strings have to be in it: build.sh checks for them before it
-    # claims a build-only run proved anything, and a mock that cannot hold them
-    # would make that check pass for the wrong reason.
-    out.write_text("mock module; not loadable\n"
-                   "CMP-DYN CMP-BAR1 cmp_pcie_gen\n")
+    args = sys.argv[1:]
+    if "-C" in args:
+        # A companion module build names its directory instead of standing in it, and the
+        # installer then checks for the .ko it asked for, so the double has to leave one
+        # there, named after the source it finds.  Not one in the caller's directory too:
+        # a test that dirtied the tree it was run from would fail for the wrong reason.
+        for src in pathlib.Path(args[args.index("-C") + 1]).glob("*.c"):
+            (src.parent / (src.stem + ".ko")).write_text("mock module; not loadable\n")
+    else:
+        out = pathlib.Path.cwd() / "kernel-open/nvidia.ko"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        # The feature strings have to be in it: build.sh checks for them before it
+        # claims a build-only run proved anything, and a mock that cannot hold them
+        # would make that check pass for the wrong reason.  The list is the one in
+        # build.sh's BUILD_ONLY marker loop, and the two have to move together.
+        out.write_text("mock module; not loadable\n"
+                       "CMP-DYN CMP-BAR1 cmp_pcie_gen CMPEnableHbmPm\n")
 elif name == "update-initramfs" and os.environ.get("FAIL_INITRAMFS"):
     sys.exit(1)
 elif name == "modprobe" and "-n" in sys.argv:
@@ -125,7 +135,14 @@ class P2PIntegration(unittest.TestCase):
             shutil.copytree(ROOT / name, self.project / name,
                             ignore=shutil.ignore_patterns(".build", "__pycache__"))
         shutil.copy2(ROOT / "install.sh", self.project / "install.sh")
-        for script in (self.project / "install.sh", self.project / "driver/build.sh"):
+        # install.sh and build.sh are the two that have always had to be redirected, and
+        # the two companion-module setup scripts join them because install.sh runs them:
+        # without the same rewriting they would build and install into the host's
+        # /lib/modules and write their config into the host's /etc, as the host's real
+        # root, which would make a test of the installer depend on the machine running it.
+        for script in (self.project / "install.sh", self.project / "driver/build.sh",
+                       self.project / "tools/hbm-pm-setup.sh",
+                       self.project / "tools/passthrough-setup.sh"):
             text = script.read_text()
             for prefix in ("/lib/modules/", "/lib/firmware/", "/etc/", "/usr/local/",
                            "/proc/", "/sys/", "/boot/"):
@@ -168,6 +185,12 @@ class P2PIntegration(unittest.TestCase):
         (self.moddir.parents[1] / "build").mkdir(parents=True)
         (self.tmp / "system/proc").mkdir(parents=True)
         (self.tmp / "system/proc/modules").write_text("")
+        # The companion-module setup scripts drop a systemd unit and a udev rule, and
+        # neither one creates its own directory: on a host that has booted, both exist
+        # before an installer runs, so the sandbox has to hold them too or the two scripts
+        # fail for a reason no real install would ever hit.
+        for directory in ("system/etc/systemd/system", "system/etc/udev/rules.d"):
+            (self.tmp / directory).mkdir(parents=True, exist_ok=True)
         self.conf = self.tmp / "system/etc/modprobe.d/cmp-pcie-gen2.conf"
         bindir = self.tmp / "bin"
         bindir.mkdir()
@@ -234,7 +257,7 @@ class P2PIntegration(unittest.TestCase):
         self.assertEqual(self.conf.read_text(),
                          'options nvidia cmp_pcie_gen=0 NVreg_EnableResizableBar=1 '
                          'NVreg_RegistryDwords="RmForceEnableGen2=1;RMPcieLinkSpeed=0xF;'
-                         'RmForceDisableIomapWC=1;CMPEnable80G=1"\n')
+                         'RmForceDisableIomapWC=1;CMPEnable80G=1;CMPEnableHbmPm=1"\n')
         self.assertFalse(any(e["cmd"] == "patch" for e in self.successful_build("")))
 
     def installer_conf(self, *options, **env):
@@ -285,10 +308,46 @@ class P2PIntegration(unittest.TestCase):
         self.assertIn("RMPcieLinkSpeed=0x1", conf)
         self.assertIn("CMPEnable80G=1", conf, "--no-gen4 turned off the wide layout too")
 
+    def test_a_default_install_hands_the_idle_cards_to_the_governor(self):
+        """The other half of idle HBM power: the module, not just the key that lets it write.
+
+        The key on the modprobe line only widens two masks during GSP bootstrap, and a
+        widened mask means nothing without something that runs afterwards to use it, so
+        an install has to leave the governor installed, loaded, and configured for the
+        next boot.  Backing the feature out has to move both halves at once, which is
+        what the stamp is for: a driver still asking for masks nobody writes through is
+        a smaller hole than a governor writing through masks a rebuild closed, but it is
+        the kind of difference that takes a reboot to notice.
+        """
+        result = self.run_script("install.sh", list(self.INSTALL_OPTIONS))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("CMPEnableHbmPm=1", self.conf.read_text())
+        self.assertTrue((self.moddir / "cmp_hbm_pm.ko").is_file(),
+                        "the governor was not installed")
+        self.assertEqual(
+            (self.tmp / "system/etc/modules-load.d/cmpunlocker-hbm.conf").read_text().strip(),
+            "cmp_hbm_pm", "nothing would load the governor on the next boot")
+        self.assertIn("cmp_hbm_pm", [e["args"][-1] for e in self.events()
+                                     if e["cmd"] == "modprobe"],
+                      "the governor was installed and never started")
+        stamp = (self.build_root / self.src_name / ".cmpunlocker-stamp").read_text()
+        result = self.run_script("install.sh",
+                                 list(self.INSTALL_OPTIONS) + ["--no-hbm-pm"])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        conf = self.conf.read_text()
+        self.assertNotIn("CMPEnableHbmPm", conf)
+        self.assertIn("CMPEnable80G=1", conf, "--no-hbm-pm turned off the wide layout too")
+        self.assertIn("cmp_pcie_gen=0", conf, "--no-hbm-pm turned the link speed back down")
+        self.assertNotEqual(
+            stamp, (self.build_root / self.src_name / ".cmpunlocker-stamp").read_text(),
+            "--no-hbm-pm reused the cached build that asked for the masks")
+
     def test_a_switch_that_is_neither_0_nor_1_fails_before_anything_is_built(self):
-        """These two used to be off, so a typo meant "stay small" silently."""
+        """These used to be off, so a typo meant "stay small" silently, and a third
+        spelling of a switch is never a decision about the card."""
         for value in ("2", "yes"):
-            for name in ("CMPUNLOCKER_EXPERIMENTAL_80G", "CMPUNLOCKER_EXPERIMENTAL_GEN4"):
+            for name in ("CMPUNLOCKER_EXPERIMENTAL_80G", "CMPUNLOCKER_EXPERIMENTAL_GEN4",
+                         "CMPUNLOCKER_HBM_PM"):
                 with self.subTest(name=name, value=value):
                     result = self.run_script("install.sh", self.INSTALL_OPTIONS,
                                              **{name: value})
@@ -469,7 +528,7 @@ class P2PIntegration(unittest.TestCase):
         self.assertNotIn("RMForceStaticBar1", self.conf.read_text())
         help_text = self.run_script("install.sh", ["--help"]).stdout
         for advertised in ("--p2p=bar1", "--p2p=mailbox", "--p2p=off",
-                           "--no-80g", "--no-gen4"):
+                           "--no-80g", "--no-gen4", "--no-hbm-pm"):
             self.assertIn(advertised, help_text)
 
     def test_an_unknown_p2p_path_is_refused_before_anything_is_built(self):

@@ -132,6 +132,14 @@ def apply_patch(src, name):
     return r
 
 
+# One hunk of pcie-gen2.patch has always landed on a line of context it did not need.
+# Everything else has to land on all of its own, because a hunk that lands with fuzz
+# matched less than it claims and can sit down in the wrong block for the wrong reason:
+# patch reads an empty line in a hunk's leading context as the end of the hunk, so a
+# payload can be accepted, and the file can still be wrong.
+FUZZ_OK = {"pcie-gen2.patch"}
+
+
 def extract(version, tmp, patches):
     """The release as NVIDIA shipped it, with these patches applied."""
     subprocess.run(["tar", "-xzf", str(tarball(version)), "-C", tmp], check=True)
@@ -140,6 +148,9 @@ def extract(version, tmp, patches):
     for name in patches:
         r = apply_patch(src, name)
         assert r.returncode == 0, "%s on %s:\n%s%s" % (name, version, r.stdout, r.stderr)
+        assert "with fuzz" not in r.stdout or name in FUZZ_OK, \
+            "%s on %s needed fuzz, so it checked fewer lines than it declares:\n%s" \
+            % (name, version, r.stdout)
     return src
 
 
@@ -252,7 +263,11 @@ def test_mailbox_p2p_applies_on_every_release(version):
 
         gsp = (src / dynfb.FILES["gsp"]).read_text()
         assert '{ 0x0012277cU, 0xffffffffU, "TRAP31_PLM" }' in gsp
-        assert "plmIdx < 13" in gsp, "the table grew but the loop still walks twelve rows"
+        # The loop walks the table rather than a counted constant, because the table is
+        # the thing that grows: a row added to it then means a mask opened on the next
+        # boot, with no second number elsewhere in the file to forget to change.
+        assert "plmIdx < sizeof(plmTable) / sizeof(plmTable[0])" in gsp, \
+            "the loop still counts rows by hand, so a new mask would sit closed"
         assert '"CMPEnableP2PMailbox"' in gsp, \
             "the extra mask is not gated, so a plain build would open it too"
 

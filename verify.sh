@@ -250,4 +250,127 @@ if (( link_failures > 0 )); then
     exit 1
 fi
 ok "Every CMP card is negotiated at Gen2 or better"
+
+# Idle power, per card.  Informational, and it stays that way: a card the governor has not
+# retimed is a card drawing exactly what it drew before this feature existed, while a card
+# the memory unlock lost is a failed install, and the two do not belong in one exit code.
+# What is worth reading here is whether anything is running at all, and what it says about
+# the last thing it tried.  "refresh access closed" is the one answer that means something
+# is wrong rather than merely idle: the masks the governor writes through are opened by the
+# driver, on request, and that request is what the key in the modprobe config is.
+echo ""
+step "Checking the idle HBM governor"
+if ! grep -q '^cmp_hbm_pm ' /proc/modules; then
+    warn "cmp_hbm_pm is not loaded: an idle card keeps the memory clock it booted with"
+    info "sudo tools/hbm-pm-setup.sh builds and starts it; install.sh does that unless --no-hbm-pm"
+elif [[ -r /sys/kernel/cmp_hbm_pm/status ]]; then
+    # Read once, and with a deadline.  Every check below is made against this text rather
+    # than by opening the file again, for two reasons: the file's answers have to agree
+    # with each other, and a read that finds the governor's worker list busy says so in
+    # the text instead of waiting in the kernel for a card (docs/HBM-PM.md).  A verifier
+    # that could sit down in the kernel would be a worse version of the thing it checks.
+    hbm_status="$(timeout 15 cat /sys/kernel/cmp_hbm_pm/status 2>&1 || true)"
+    hbm_says() { printf '%s\n' "${hbm_status}" | grep -q "$1"; }
+    if [[ -z "${hbm_status}" ]]; then
+        warn "cmp_hbm_pm is loaded but its status file could not be read at all, within 15 s"
+        warn "or otherwise: sudo journalctl -k -b | grep cmp_hbm_pm says what it is doing."
+    elif hbm_says 'status unavailable'; then
+        warn "The governor's worker list was held for the whole wait, so nothing below was"
+        warn "checked.  A perf table read or a policy change is still running; the cards are"
+        warn "not necessarily wrong.  Read /sys/kernel/cmp_hbm_pm/status again after it ends."
+    else
+        while IFS= read -r line; do
+            info "  ${line}"
+        done <<< "${hbm_status}"
+        if hbm_says 'errors [1-9]'; then
+            warn "A transition has failed since the module loaded; docs/HBM-PM.md says what each"
+            warn "reason means and which of them are a closed mask rather than the card."
+        fi
+        # The state that costs a card rather than watts.  `halted` means the module asked
+        # for the framebuffer and could not hand it back, so it has stopped touching the
+        # card -- which is the right thing to have done, and is also a card nobody can
+        # use until it is reset.  Nothing else in this file is worth exiting for.
+        if hbm_says 'halted'; then
+            err "cmp_hbm_pm has halted a card: it stopped that card's framebuffer and could"
+            err "not start it again, and will not touch it until the module is reloaded. Save"
+            err "'sudo journalctl -k -b | grep cmp_hbm_pm' first, then reset the GPU."
+        fi
+        # The failure mode the wattmeter cannot show: the governor loaded, and the half of
+        # the feature that knows whether anything is using a card is not running, so every
+        # card keeps its busy clock forever and looks like a machine with nothing idle on
+        # it.  Both directions have to be reported, because both are silent.
+        #
+        # `stale` is matched with its leading space because that is how the status file
+        # prints it -- `lease 74825 ms busy stale clients65` -- and an answer that has aged
+        # out is a keeper that stopped answering while the card kept the state it was last
+        # told, which is the one case where reading the note alone would be reassuring.
+        if hbm_says 'lease none' || hbm_says ' stale'; then
+            # "Is the keeper meant to be here" is not the same question as "is it alive
+            # this instant".  A keeper that fails every round -- no NVML, no card it can
+            # name, a thresholds file it cannot read -- spends most of its life
+            # `activating` behind RestartSec, which is precisely the state the three
+            # keeper bugs that shipped today lived in, and `is-active` files that away
+            # as an absent keeper.  What says somebody asked for this feature is the
+            # unit being installed, so that is the gate, and the state is printed
+            # rather than used to decide which paragraph the operator deserves.
+            keeper_meant=0
+            if command -v systemctl >/dev/null 2>&1; then
+                if [[ -e /etc/systemd/system/cmp-hbm-lease.service ]] ||
+                       systemctl is-enabled --quiet cmp-hbm-lease.service 2>/dev/null; then
+                    keeper_meant=1
+                fi
+            fi
+            if [[ "${keeper_meant}" == 1 ]]; then
+                # A second read, on purpose: the first one is the record everything
+                # above is judged from, this one asks only whether anybody is home,
+                # and it waits a round first because a module loaded three seconds
+                # ago has not been given the chance to be answered yet.
+                #
+                # Every card has to be answered, and answered *currently*: a lease is
+                # printed with its age and its verdict, so `lease 4775 ms quiet stale`
+                # matches a test that only looks for a dated lease and congratulates a
+                # keeper that died a minute ago.  This check was written to catch
+                # exactly that and did not, until it was run against the failure.
+                sleep 3
+                hbm_recheck="$(timeout 15 cat /sys/kernel/cmp_hbm_pm/status 2>&1 || true)"
+                if ! printf '%s\n' "${hbm_recheck}" | grep -qE '^[0-9a-f]{4}:'; then
+                    warn "The keeper could not be checked: /sys/kernel/cmp_hbm_pm/status gave"
+                    warn "no card lines this time, and an unreadable status file is not the"
+                    warn "same thing as a working keeper.  Read it by hand once the card has"
+                    warn "come up."
+                elif printf '%s\n' "${hbm_recheck}" | grep -E '^[0-9a-f]{4}:' |
+                        grep -qE 'lease none|lease [0-9]+ ms .* stale'; then
+                    err "cmp-hbm-lease.service is installed (state: $(systemctl is-active cmp-hbm-lease.service 2>&1), restarted $(systemctl show -p NRestarts --value cmp-hbm-lease.service 2>&1) times) and a card still has no current answer, which is a keeper that cannot read something rather than a machine with an idle card on it."
+                    err "journalctl -u cmp-hbm-lease.service -b names the card it could not"
+                    err "identify or the reading it could not take.  Three failures like this"
+                    err "shipped at once, and every one of them looked like the warning this"
+                    err "block otherwise prints: docs/HBM-PM.md, under \"What has been"
+                    err "checked\", is the record of that."
+                else
+                    ok "The keeper is answering: every card holds a dated, unexpired lease"
+                fi
+            else
+                warn "Some card has no current answer from the lease keeper, so it stays at its"
+                warn "busy clock: systemctl status cmp-hbm-lease.service, and the keeper's own"
+                warn "journal says why it stopped answering.  tools/hbm-pm-setup.sh installs it."
+            fi
+        elif hbm_says 'lease waived'; then
+            warn "lease_ms=0: the governor is deciding to idle a card on its borrowed counters"
+            warn "alone.  Those were measured reading nothing for 8.4 s on a card serving"
+            warn "requests at 178 W, so this is a bench setting and not a way to run a box."
+        fi
+        # The other way the two halves of this feature can disagree: the governor is
+        # loaded, so the install asked for it, but the driver that is installed never got
+        # the key that lets the booter open the masks it writes through.  Reading the
+        # status file alone cannot tell that apart from a card that has not come up yet,
+        # and the answer is a rebuild rather than a wait, so say which.
+        if hbm_says 'refresh access closed' &&
+           ! grep -q 'CMPEnableHbmPm=1' /etc/modprobe.d/cmp-pcie-gen2.conf 2>/dev/null; then
+            warn "The installed driver was built without CMPEnableHbmPm=1, so the governor"
+            warn "cannot open the masks it writes through: sudo install.sh to rebuild both."
+        fi
+    fi
+else
+    warn "cmp_hbm_pm is loaded but has written no status file; the firmware is still coming up"
+fi
 exit 0

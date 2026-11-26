@@ -2,7 +2,7 @@
 
 ## 取证更新：已确认 payload 越界写
 
-移除显卡后通过 192.168.67.114 取证。journal 无持久记录，但 EFI pstore 已归档到
+移除显卡后从局域网上的另一台机器取证。journal 无持久记录，但 EFI pstore 已归档到
 `/var/lib/systemd/pstore/`。`179489835/dmesg.txt` 的首次 Oops：
 
 - `nv_open_q` 在线程内调用 `kgspSec2PostblTimingRefillPayload`。

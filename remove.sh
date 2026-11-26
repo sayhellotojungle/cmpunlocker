@@ -18,6 +18,8 @@ if [[ "${1:-}" != "--yes" && "${1:-}" != "-y" ]]; then
     echo "  - Removes /lib/modules/*/updates/cmpunlocker/"
     echo "  - Removes ${INSTALL_DIR} (legacy install dir, if present)"
     echo "  - Removes cmpretrain service / modprobe Gen2 and P2P settings"
+    echo "  - Removes the idle HBM governor (cmp_hbm_pm, its modules-load.d entry) and the
+    lease keeper that tells it which cards nobody is using"
     echo "  - Removes VM passthrough helpers (service, udev rule, vfio modprobe conf)"
     echo "  - Rebuilds the stock nvidia DKMS modules that install.sh removed"
     echo "  - Reloads stock NVIDIA modules (brief display interruption)"
@@ -94,6 +96,31 @@ for bdf in "${cmp_bdfs[@]}"; do
 done
 systemctl daemon-reload 2>/dev/null || true
 ok "Removed VM passthrough helpers"
+
+# Before the NVIDIA modules go away: the governor maps BAR0 and owes each card the
+# clock it lowered, and rmmod is where it hands that back.  The .ko itself goes with
+# updates/cmpunlocker/ below, and the key that let the driver widen the two masks it
+# wrote through went with /etc/modprobe.d/cmp-pcie-gen2.conf above.
+info "Removing the idle HBM governor"
+# The keeper first, and by name rather than by deletion below: a unit left running
+# against a lease file that has just gone away exits 75, systemd restarts it, and the
+# machine fills its journal with a service nobody is going to install again.
+if systemctl disable --now cmp-hbm-lease.service 2>/dev/null; then
+    ok "Stopped cmp-hbm-lease.service"
+fi
+systemctl daemon-reload 2>/dev/null || true
+rm -f /etc/systemd/system/cmp-hbm-lease.service
+rm -f /usr/local/lib/cmpunlocker/hbm-lease.py
+# The thresholds the installed keeper was pointed at.  Leaving it behind is the
+# untidy direction; leaving it behind while the keeper is gone is worse, because the
+# next install of a different tree's keeper would read the floors of this one.
+rm -f /usr/local/share/cmpunlocker/constants.yaml
+rmdir /usr/local/share/cmpunlocker 2>/dev/null || true
+if grep -q '^cmp_hbm_pm ' /proc/modules; then
+    rmmod cmp_hbm_pm 2>/dev/null || true
+fi
+rm -f /etc/modules-load.d/cmpunlocker-hbm.conf
+ok "Removed the idle HBM governor and its lease keeper"
 
 info "Restoring IOMMU kernel command line"
 iommu_restored=0

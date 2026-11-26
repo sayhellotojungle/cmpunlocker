@@ -13,6 +13,12 @@ ENABLE_P2P="${CMPUNLOCKER_ENABLE_P2P:-off}"
 # stamp reads the same as it always did; the default is what moved.
 ENABLE_80G="${CMPUNLOCKER_EXPERIMENTAL_80G:-1}"
 ENABLE_GEN4="${CMPUNLOCKER_EXPERIMENTAL_GEN4:-1}"
+# HBM idle power is on unless something says otherwise, like the other two.  It is
+# the only one of the three that keeps running after boot: the key below is what
+# lets the patched driver open the two masks the governor in driver/hbm-pm writes
+# through, and dropping the key alone (no rebuild) is enough to leave a card alone,
+# because the governor reports "refresh access closed" and stays out.
+ENABLE_HBM_PM="${CMPUNLOCKER_HBM_PM:-1}"
 PATCH_DIR="${SCRIPT_DIR}/patches"
 BUILD_ROOT="${CMPUNLOCKER_BUILD_DIR:-${SCRIPT_DIR}/.build}"
 SRC_NAME="open-gpu-kernel-modules-${VERSION}"
@@ -64,6 +70,10 @@ esac
 case "${ENABLE_GEN4}" in
     0|1) ;;
     *) die "CMPUNLOCKER_EXPERIMENTAL_GEN4 must be 0 or 1" ;;
+esac
+case "${ENABLE_HBM_PM}" in
+    0|1) ;;
+    *) die "CMPUNLOCKER_HBM_PM must be 0 or 1" ;;
 esac
 case "${BUILD_ONLY}" in
     0|1) ;;
@@ -192,7 +202,7 @@ CONSTANTS="${SCRIPT_DIR}/../common/constants.yaml"
 CONSTANTS_ENV="$(python3 "${SCRIPT_DIR}/../tools/read-constants.py" "${CONSTANTS}" "${PATCH_DIR}" "${SCRIPT_DIR}/build.sh" "${PROFILE}")" || die "common/constants.yaml rejected (see error above)"
 eval "${CONSTANTS_ENV}"
 
-BUILD_STAMP="${VERSION}:${KVER}:${PROFILE}:p2p=${P2P_MODE}:experimental80g=${ENABLE_80G}:${PATCH_HASH}:$(sha256sum "${SCRIPT_DIR}/build.sh" | cut -d' ' -f1)"
+BUILD_STAMP="${VERSION}:${KVER}:${PROFILE}:p2p=${P2P_MODE}:experimental80g=${ENABLE_80G}:hbmpm=${ENABLE_HBM_PM}:${PATCH_HASH}:$(sha256sum "${SCRIPT_DIR}/build.sh" | cut -d' ' -f1)"
 
 mkdir -p "${BUILD_ROOT}"
 
@@ -368,7 +378,7 @@ if [[ "${BUILD_ONLY}" -eq 1 ]]; then
         MODULES+=("${candidate}")
     done < <(find . -name nvidia.ko -not -path '*/conftest/*')
     [[ ${#MODULES[@]} -gt 0 ]] || die "Build produced no nvidia.ko"
-    for marker in 'CMP-DYN' 'CMP-BAR1' 'cmp_pcie_gen'; do
+    for marker in 'CMP-DYN' 'CMP-BAR1' 'cmp_pcie_gen' 'CMPEnableHbmPm'; do
         if grep -a -q -- "${marker}" "${MODULES[@]}"; then
             ok "nvidia.ko contains ${marker}"
         else
@@ -423,6 +433,14 @@ if [[ "${ENABLE_80G}" -eq 1 ]]; then
     # experiment can be turned off from this file alone, no rebuild needed.
     REGISTRY_DWORDS+=";CMPEnable80G=1"
 fi
+if [[ "${ENABLE_HBM_PM}" -eq 1 ]]; then
+    # The other half of the HBM idle governor (driver/hbm-pm): the patch asks for
+    # this key before it lets the booter widen the FBPA refresh block and the
+    # memory PLL, so removing it here is enough to make the governor's two masks
+    # stay closed.  Same shape as CMPEnable80G above: one line in this file turns
+    # the feature off on a running box, with no rebuild.
+    REGISTRY_DWORDS+=";CMPEnableHbmPm=1"
+fi
 case "${P2P_MODE}" in
     bar1)
         # The BAR1 route is RM's own: static BAR1 covering the whole framebuffer,
@@ -448,7 +466,7 @@ printf 'options nvidia %sNVreg_EnableResizableBar=1 NVreg_RegistryDwords="%s"\n'
     "${MODULE_PARAMS}" "${REGISTRY_DWORDS}" \
     > /etc/modprobe.d/cmp-pcie-gen2.conf
 printf '%s\n' "${P2P_MODE}" > "${INSTALL_MOD_DIR}/p2p_enabled"
-ok "Configured Gen2/P2P module options (P2P=${P2P_MODE}, Gen4=${ENABLE_GEN4})"
+ok "Configured Gen2/P2P module options (P2P=${P2P_MODE}, Gen4=${ENABLE_GEN4}, HBM idle power=${ENABLE_HBM_PM})"
 
 depmod -a "${KVER}"
 ok "depmod complete"

@@ -21,6 +21,13 @@ DEPRECATED_GEN2_FLAG=0
 # The variable names are the ones this has always used; only their default moved.
 ENABLE_80G="${CMPUNLOCKER_EXPERIMENTAL_80G:-1}"
 ENABLE_GEN4="${CMPUNLOCKER_EXPERIMENTAL_GEN4:-1}"
+# Idle HBM power is the third of these, and it is on for the same reason: a card
+# with one performance level never lowers its memory clock by itself, so the only
+# thing this can do to a card that is not moving the framebuffer is stop paying for
+# the rate it was already paying.  What makes it different from the other two is
+# that it is a module that keeps running, which is why it has a step of its own
+# below and a mask request in the driver build.
+ENABLE_HBM_PM="${CMPUNLOCKER_HBM_PM:-1}"
 for arg in "$@"; do
     case "${arg}" in
         --profile=8gb|--profile=8GB) PROFILE_OVERRIDE="8gb" ;;
@@ -33,6 +40,7 @@ for arg in "$@"; do
         --p2p) P2P_MODE="mailbox" ;;
         --no-80g) ENABLE_80G=0 ;;
         --no-gen4) ENABLE_GEN4=0 ;;
+        --no-hbm-pm) ENABLE_HBM_PM=0 ;;
         --p2p=*)
             P2P_MODE="${arg#*=}"
             case "${P2P_MODE}" in
@@ -48,8 +56,8 @@ for arg in "$@"; do
         --no-passthrough) CONFIGURE_PASSTHROUGH=0 ;;
         -h|--help)
             cat <<'EOF'
-Usage: sudo ./install.sh [--profile=8gb|10gb] [--no-80g] [--no-gen4] [--no-iommu]
-                         [--no-passthrough] [--p2p=bar1|mailbox|off]
+Usage: sudo ./install.sh [--profile=8gb|10gb] [--no-80g] [--no-gen4] [--no-hbm-pm]
+                         [--no-iommu] [--no-passthrough] [--p2p=bar1|mailbox|off]
 
 Everything the unlock does to a card is on by default and decided per card from the
 card's own fuses, so a plain install unlocks every card it finds and asks none of them
@@ -67,6 +75,15 @@ is the one feature that also needs host setup and a real transfer test to mean a
   --no-gen4       Leave every card at Gen2. On by default: each card is asked for the
                   speed its own PCIe speed fuses allow, so a soft-unlocked card stays
                   at Gen2 and a burned card reaches Gen4 where the slot carries it.
+  --no-hbm-pm     Leave every card's HBM at the clock it boots to. On by default: the
+                  card's VBIOS carries one performance level, so nothing ever asks the
+                  memory PLL to come down and an idle card pays full refresh rate
+                  forever. This installs cmp_hbm_pm.ko, which moves the memory clock
+                  down when the activity counters have been still and a second half --
+                  cmp-hbm-lease.service, asking the driver once a second -- has said the
+                  card holds nothing at all, and back up the moment either disagrees.
+                  /sys/kernel/cmp_hbm_pm/status is the per-card answer, and
+                  docs/HBM-PM.md is what it costs and how to measure it.
   --p2p          Same as --p2p=mailbox: no large BAR1 needed, and the only route a card
                   on the wide (80 GiB) layout can take.
   --p2p=bar1     GPU-to-GPU P2P through a static BAR1 that maps the whole
@@ -118,15 +135,15 @@ EOF
     esac
 done
 
-# Checked here, before anything is downloaded or built: these two used to be opt-in
+# Checked here, before anything is downloaded or built: these used to be opt-in
 # environment variables, and a typo in one of them used to mean "stay on the small
 # layout" silently.  Now that they default to on, a bad value says so.
-for flag in "${ENABLE_80G}" "${ENABLE_GEN4}"; do
+for flag in "${ENABLE_80G}" "${ENABLE_GEN4}" "${ENABLE_HBM_PM}"; do
     case "${flag}" in
         0|1) ;;
         *)
-            echo "CMPUNLOCKER_EXPERIMENTAL_80G and CMPUNLOCKER_EXPERIMENTAL_GEN4 take 0 or 1" >&2
-            echo "(got '${flag}'; --no-80g and --no-gen4 are the flags for the installer)" >&2
+            echo "CMPUNLOCKER_EXPERIMENTAL_80G, CMPUNLOCKER_EXPERIMENTAL_GEN4 and CMPUNLOCKER_HBM_PM take 0 or 1" >&2
+            echo "(got '${flag}'; --no-80g, --no-gen4 and --no-hbm-pm are the flags for the installer)" >&2
             exit 1
             ;;
     esac
@@ -137,7 +154,7 @@ exec > >(tee -a "${LOG_FILE}") 2>&1
 source "${SCRIPT_DIR}/common/lib.sh"
 
 banner
-step_init 7
+step_init 8
 
 step "Verifying root privileges"
 [[ "${EUID}" -eq 0 ]] || die "Run as root: sudo ./install.sh"
@@ -334,6 +351,11 @@ if [[ "${ENABLE_GEN4}" == "1" ]]; then
 else
     info "Every card stays at Gen2 (off with --no-gen4; drop it to ask per card)"
 fi
+if [[ "${ENABLE_HBM_PM}" == "1" ]]; then
+    info "Asking the booter to widen the two blocks the idle HBM governor writes through"
+else
+    info "Idle HBM power off (off with --no-hbm-pm); the masks stay closed and no card is retimed"
+fi
 chmod +x "${SCRIPT_DIR}/driver/build.sh"
 CMPUNLOCKER_DRIVER_VERSION="${detected}" \
 CMPUNLOCKER_CARD_PROFILE="${CARD_PROFILE}" \
@@ -341,8 +363,26 @@ CMPUNLOCKER_GPU_INVENTORY="${CMPUNLOCKER_GPU_INVENTORY}" \
 CMPUNLOCKER_ENABLE_P2P="${P2P_MODE}" \
 CMPUNLOCKER_EXPERIMENTAL_80G="${ENABLE_80G}" \
 CMPUNLOCKER_EXPERIMENTAL_GEN4="${ENABLE_GEN4}" \
+CMPUNLOCKER_HBM_PM="${ENABLE_HBM_PM}" \
     "${SCRIPT_DIR}/driver/build.sh"
 ok "Patched modules installed (profile ${CARD_PROFILE})"
+
+step "Lowering idle HBM power"
+HBM_PM_STATUS="skipped"
+if (( ENABLE_HBM_PM == 1 )); then
+    chmod +x "${SCRIPT_DIR}/tools/hbm-pm-setup.sh"
+    if CMPUNLOCKER_KVER="$(uname -r)" "${SCRIPT_DIR}/tools/hbm-pm-setup.sh"; then
+        HBM_PM_STATUS="running"
+    else
+        # A governor that would not build or would not load costs watts and nothing
+        # else: the card is on the clock it has always been on, which is the state a
+        # machine without this feature is in anyway.
+        HBM_PM_STATUS="unavailable"
+        warn "idle HBM power not active; every card keeps the clock it booted with"
+    fi
+else
+    warn "--no-hbm-pm given; an idle card still pays full refresh rate"
+fi
 
 step "Setting up VM passthrough"
 PASSTHROUGH_STATUS="skipped"
@@ -566,6 +606,19 @@ if [[ "${ENABLE_GEN4}" == "1" ]]; then
 else
     echo "PCIe:    every card pinned to Gen2 (--no-gen4)"
 fi
+case "${HBM_PM_STATUS}" in
+    running)     echo "HBM:     idle cards retimed by cmp_hbm_pm (cat /sys/kernel/cmp_hbm_pm/status)"
+                 # Worth saying here rather than only in the step above: with no lease
+                 # answer the governor is loaded, harmless, and doing nothing, which a
+                 # reader of this summary would otherwise take for a card with nothing
+                 # idle on it.
+                 if [[ -r /sys/kernel/cmp_hbm_pm/status ]] &&
+                    grep -qE 'lease (none|stale)' /sys/kernel/cmp_hbm_pm/status; then
+                     echo "         but the lease keeper has not answered for every card: those keep the busy clock"
+                 fi ;;
+    unavailable) echo "HBM:     busy clock on every card (cmp_hbm_pm.ko did not take; see above)" ;;
+    *)           echo "HBM:     busy clock on every card (--no-hbm-pm)" ;;
+esac
 if [[ -n "${IOMMU_PARAMS}" && "${IOMMU_STATUS}" != "skipped" ]]; then
     echo "IOMMU:   ${IOMMU_PARAMS} (${IOMMU_STATUS})"
 else

@@ -15,8 +15,11 @@ jobs:
           path: driver/.build/*.tar.gz
           key: open-gpu-kernel-modules-${{ hashFiles('driver/VERSION') }}
           restore-keys: open-gpu-kernel-modules-
+      # PyYAML is in this list because constants.yaml is the one place the registers this
+      # driver writes are written down, and tests/test_hbm_pm.py runs the build's own
+      # checker over it instead of keeping a second copy of its rules.
       - run: |
           sudo apt-get update
-          sudo apt-get install -y shellcheck patch python3-pytest
+          sudo apt-get install -y shellcheck patch python3-pytest python3-yaml
           sudo apt-get install -y "linux-headers-$(uname -r)" || sudo apt-get install -y linux-headers-generic
       - run: python3 -m pytest -v
