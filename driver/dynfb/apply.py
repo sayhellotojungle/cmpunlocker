@@ -121,13 +121,16 @@ HOOKS = [
      'skipping link retrain\\n", ret);\n}\n', "",
      "hooks/nv_gen4.c"),
 
-    # The Gen3 -> E1 -> Gen4 sequence runs once, from nv.c post-init, and it has to
-    # stay that way.  A second copy here was tried: RM's own PCIe init rewrites
-    # LINK_CONFIG back to Gen2 after it, so nv.c entered with CYA_0 already holding
-    # the E1 value and the pass that mattered replayed nothing.  The verified
-    # bring-up runs one pass from the VBIOS state.  What a second pass costs exactly
-    # is hard to separate from a partner that caps the link below the target; what it
-    # cannot buy is a faster link, and the hook now keeps Gen3 either way.
+    # The Gen3 -> E1 -> Gen4 sequence has exactly one home, in nv.c post-init, and it
+    # has to stay that way.  A second copy at GSP bootstrap was tried: RM's own PCIe
+    # init rewrites LINK_CONFIG back to Gen2 after it, so nv.c entered with CYA_0
+    # already holding the E1 value and the pass that mattered replayed nothing.  The
+    # hook may walk the ladder again from where it stands (cmp_pcie_retries, for the
+    # boards whose port needs the Gen3 rung re-taken: an EPYC root port honours the
+    # Gen2 target speed the retrain above leaves there, a PEX880xx downstream port
+    # does not), and a second walk is only worth anything because the hook re-arms the
+    # equalisation edge first.  What a second *copy* cannot buy is a faster link, and
+    # the hook keeps Gen3 either way.
 
     # P2P, opt-in with --p2p.  These were context-diff hunks (p2p/0007 and the first
     # two hunks of p2p/0011) and are here because a context diff cannot express them:

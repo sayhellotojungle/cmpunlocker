@@ -50,7 +50,9 @@ Implemented functions:
 - **PCIe Gen4 on hardware-unlocked cards, on by default.** Every supported card is retrained
   from Gen1 to Gen2 at driver init. Above Gen2, a per-card sequence supplies the PHY
   initialisation the VBIOS omits; the target is the card's own speed fuses, so a
-  soft-unlocked card stays at Gen2 and `--no-gen4` leaves every card there. A link that
+  soft-unlocked card stays at Gen2 and `--no-gen4` leaves every card there. Every rung of
+  that sequence is asked of both ends of the link and confirmed at both ends, which is
+  what makes it land on an AMD root port as well as behind a PCIe switch. A link that
   cannot reach its target keeps the speed it trained, down to but not below Gen2.
 
 ### Differences from the upstream branch
@@ -367,10 +369,16 @@ card itself, so any slot works and cards can be mixed freely.
   20 attempts.
   Above Gen2 the link needs the **Gen3 -> E1 DevInit replay -> Gen4** sequence, because
   the VBIOS leaves out the PHY-init block that makes 16 GT/s trainable and a link
-  sitting at 5 GT/s cannot be retrained directly to it. It runs **once**, at driver
+  sitting at 5 GT/s cannot be retrained directly to it. It has **one home**, driver
   post-init: a second copy at GSP bootstrap left the PHY-init registers pre-set, RM's
   PCIe init rewrote the rate field back to Gen2 in between, and the pass that mattered
-  then replayed the value it read without producing an equalisation edge. The target is
+  then replayed the value it read without producing an equalisation edge. Every rung of
+  it is asked of **both ends** of the link and confirmed at both ends, because a speed
+  the partner is not asking for is a speed the link will not reach — and the port above
+  the card was pinned to Gen2 by the retrain two lines before. `cmp_pcie_retries` walks
+  the whole ladder again for a board that needs the Gen3 rung re-taken; a second walk
+  re-arms the equalisation edge first, or it replays the value the first walk left
+  there, which is the same nothing the GSP-bootstrap copy produced. The target is
   read from the card's own `LNKCAP2` supported-speeds vector, which is what the PCIe
   speed fuses drive: a soft-unlocked card reports Gen2 and is not asked for more, so one
   build serves a box holding both kinds.
@@ -378,11 +386,22 @@ card itself, so any slot works and cards can be mixed freely.
   not below Gen3, and both ends of the link plus the card's own rate fields are set to
   the speed it holds, so a later retrain does not request a speed the slot cannot carry.
   Only a link that cannot hold Gen3 returns to the Gen2 path. The fuse value states what
-  a card may request, not what the board it sits in will carry, so the two can differ.
+  a card may request, not what the board it sits in will carry, so the two can differ,
+  and the log names the port's own speed vector alongside the card's so a reader can
+  tell the two apart. `verify.sh` prints `GEN3 OK, Gen4 missed` for a card whose fuses
+  allow more than the link carries; that is a report, not a failure.
   On the bench, two cold boots with the feature enabled both reached the top tier
   (`CMP Gen4: link trained (LnkSta=0x1104)`, upstream bridge `0x2104`) and the link was
   unchanged when read again with the serving workload running; the Gen3 tier is the
-  fallback path and was not exercised on this machine.
+  fallback path and was not exercised on this machine. That bench hangs its cards behind
+  a PEX880xx switch, and a switch downstream port is forgiving about a rate change the
+  card asks for alone: an EPYC server (card `41:00.0` on root port `40:03.1`) with the
+  one-sided version of Phase A never reached Gen4 at boot at all, because the AMD root
+  port honours the Gen2 target speed the Gen2 retrain leaves on it, so the E1 block was
+  replayed onto a PHY still at 5 GT/s. What worked there was a companion unit reloading
+  the driver, whose real contribution was a first pass that left the link settled at
+  8 GT/s — the property the both-ended rung now provides without the reload, at the cost
+  of a few hundred ms per card per attempt at init.
 
 Both switches are on for a normal install, and both are part of the build cache, so
 `--no-80g` and `--no-gen4` are rebuilds rather than reconfigurations. `--no-80g`, or the

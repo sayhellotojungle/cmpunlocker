@@ -195,7 +195,7 @@ nv_cmp170hx_link_retrain(struct pci_dev *gpu, struct pci_dev *upstream, NvU32 ge
     u16 gpu_ctl2, upstream_ctl2, upstream_ctl;
     int attempt;
     int ret;
-    int trained = 0;
+    int trained;
 
     // Never report a speed read on an earlier pass as this one's result.
     trained = nv_cmp170hx_link_speed(gpu, upstream, status, partner_status);
@@ -246,6 +246,10 @@ nv_cmp170hx_link_retrain(struct pci_dev *gpu, struct pci_dev *upstream, NvU32 ge
         trained = nv_cmp170hx_link_speed(gpu, upstream, status, partner_status);
         if (trained < 0)
         {
+            // Config space stopped answering mid-retrain: the card is gone, or the
+            // link never came back.  Record that so the caller's log does not blame a
+            // write that returned 0.
+            *err = -1;
             continue;
         }
         if ((NvU32)trained >= gen)
@@ -261,7 +265,7 @@ nv_cmp170hx_link_retrain(struct pci_dev *gpu, struct pci_dev *upstream, NvU32 ge
  * rate fields go to Gen3 and the LTSSM is taken through Recovery; by the end of it
  * the PHY is running and the E1 block has something to work on. */
 static void
-nv_cmp170hx_gen3_step(struct pci_dev *gpu, void __iomem *bar0)
+nv_cmp170hx_gen3_step(void __iomem *bar0)
 {
     u32 v, dlmgr;
     int i;
@@ -407,7 +411,7 @@ nv_cmp170hx_gen4_post(nv_state_t *nv)
         }
 
         // ---- Phase A: the Gen3 step, asked of both ends of the link ----
-        nv_cmp170hx_gen3_step(gpu, bar0);
+        nv_cmp170hx_gen3_step(bar0);
 
         // Phase 16 GT/s needs "Perform Equalization" requested on both ends, and the
         // Gen3 retrain below may consume the request, so it goes back a second time
@@ -428,7 +432,7 @@ nv_cmp170hx_gen4_post(nv_state_t *nv)
             {
                 // Config space is gone, or the board above the card does not do
                 // 8 GT/s.  Neither gets better by asking twice.
-                break;
+                goto fallback;
             }
             continue;
         }
@@ -487,7 +491,7 @@ nv_cmp170hx_gen4_post(nv_state_t *nv)
                               "CMP Gen%u: Gen3 lost after E1 (LnkSta=0x%04x "
                               "port LnkSta=0x%04x)\n", target, link_status,
                               partner_status);
-                break;
+                goto fallback;
             }
         }
 
@@ -507,7 +511,7 @@ nv_cmp170hx_gen4_post(nv_state_t *nv)
         {
             NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
                           "CMP Gen%u: config space access failed (%d)\n", target, ret);
-            break;
+            goto fallback;
         }
 
         if (trained >= 3)
@@ -540,7 +544,7 @@ nv_cmp170hx_gen4_post(nv_state_t *nv)
             }
             // The link will not even hold the speed it just trained; nothing above
             // Gen2 is available on this board.
-            break;
+            goto fallback;
         }
 
         NV_DEV_PRINTF(NV_DBG_ERRORS, nv,

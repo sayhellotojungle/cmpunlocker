@@ -210,6 +210,7 @@ ok "All ${#GPU_BDFS[@]} unlockable GPU(s) report unlocked memory"
 echo ""
 step "Checking the negotiated PCIe link"
 link_failures=0
+link_misses=0
 printf '%-16s %-16s %-10s %-14s %-8s %s\n' \
        "GPU" "Upstream" "LnkSta" "Current speed" "Width" "Result"
 for sysdev in /sys/bus/pci/devices/*/device; do
@@ -236,6 +237,17 @@ for sysdev in /sys/bus/pci/devices/*/device; do
     fi
     if [[ "${generation}" =~ ^[0-9]+$ ]] && (( generation >= 2 )); then
         result="GEN${generation} OK"
+        # Gen2 is the floor; the ceiling is this card's own speed fuses, and the two
+        # are different questions.  A card whose fuses allow Gen4 that ended up on a
+        # lower speed is not broken (the port above it may cap it, and a Gen3 slot is
+        # a legitimate answer), but it is worth one honest column: that card's
+        # bring-up did not reach what the card may ask for, and the driver said why.
+        cap2="$(setpci -s "${bdf}" CAP_EXP+2c.l 2>/dev/null || true)"
+        if [[ "${cap2}" =~ ^[0-9a-fA-F]{8}$ ]] && (( 0x${cap2} & 0x10 )) &&
+           (( generation < 4 )); then
+            result="GEN${generation} OK, Gen4 missed"
+            link_misses=$((link_misses + 1))
+        fi
     else
         result="below Gen2"
         link_failures=$((link_failures + 1))
@@ -250,6 +262,13 @@ if (( link_failures > 0 )); then
     exit 1
 fi
 ok "Every CMP card is negotiated at Gen2 or better"
+if (( link_misses > 0 )); then
+    warn "${link_misses} card(s) carry Gen4 in their fuses and run below it."
+    warn "dmesg | grep 'CMP Gen' names the end that capped the link, and says whether"
+    warn "the bring-up was never asked (a card left on Gen2 by its own fuse vector)"
+    warn "or asked and refused. cmp_pcie_retries walks the ladder again at init; a port"
+    warn "whose BIOS pins its speed is not something a driver can argue with."
+fi
 
 # Idle power, per card.  Informational, and it stays that way: a card the governor has not
 # retimed is a card drawing exactly what it drew before this feature existed, while a card

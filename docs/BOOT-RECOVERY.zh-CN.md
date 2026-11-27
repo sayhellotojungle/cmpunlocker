@@ -90,9 +90,17 @@ CMP SKU 的身份认知，驱动改 `LnkCap` 无效。ECC 计数被补丁清零�
 显存健康。
 
 实现只有一处：`driver/dynfb/hooks/nv_gen4.c`（Phase A Gen3 台阶 → Phase B E1
-重放 → Phase C 配置空间重训），在 driver post-init **只跑一次**。目标按卡取：读
-自己的 `LNKCAP2` Supported Link Speeds Vector，只软解的卡报 Gen2 因而完全不进这条
+重放 → Phase C 配置空间重训），挂在 driver post-init。目标按卡取：读自己的
+`LNKCAP2` Supported Link Speeds Vector，只软解的卡报 Gen2 因而完全不进这条
 路径；GSP 期那条 Gen2 钳制照旧写，本序列会用 `XVE_OVR=0x8` 盖掉它。
+
+**每一级台阶都向链路两端索取，并在两端确认。** `nv_cmp170hx_retrain_gen2()` 在
+本序列前两行把上游口 `LNKCTL2` 目标速率写成 Gen2，本卡单方面抬到 Gen3 并不等于链路
+抬到 Gen3：Phase A 之后会用一次「两端同时抬到 Gen3」的重训把这一台阶踩实，双端
+`LnkSta` 都读到 8 GT/s 才继续，并留 250ms 让链路静置，再把 E1 块写进一个真的在
+8 GT/s 跑的 PHY。E1 块本身可能把链路踢下 Recovery，所以写完还会再确认一次，掉了就
+重新补这一台阶，再抬目标代际。上游口自己的速度向量也读出来打进日志：卡能请求多高与
+板子给多高是两件事，日志要能区分是哪一端封顶。
 
 退路按 `LnkSta` 实际训练到的代际收口。达到目标即收口；未达目标但链路已稳定在 Gen3 时
 保持 Gen3，并同时改写两端 `LNKCTL2` 目标与本卡 `LINK_CONFIG_0`/`PL_LINK_RATE` 速率字段
@@ -103,14 +111,31 @@ CMP SKU 的身份认知，驱动改 `LnkCap` 无效。ECC 计数被补丁清零�
 不一致，分层回退即针对该情况。达到 Gen4 时收口在 Gen4，链路只支持到 Gen3 时收口在 Gen3，
 不将已稳定训练的 8 GT/s 降回 5 GT/s。台架 2026-11-18 两次冷启动均达到最高档
 （`link trained (LnkSta=0x1104)`，上游桥 `0x2104`），Gen3 一档为回退路径，本机未触发。
-`verify.sh` 的判据为 Gen2 下限、高于下限的代际按实测报告，因此 Gen3 与 Gen4 均判为通过。
+`verify.sh` 的判据为 Gen2 下限、高于下限的代际按实测报告，因此 Gen3 与 Gen4 均判为通过；
+熔丝允许 Gen4 而链路低于 Gen4 的卡会额外标 `Gen4 missed`，这是提示不是失败，`dmesg`
+里的 `CMP Gen` 行会说明是没被索取过还是索取被拒。
 
-「只跑一次」这一约束由 2026-11-18 的上机实验确定：曾在 GSP bootstrap 再放一份同样的序列，结果
-进 nv.c 时 `CYA_0` 已是 E1 的值 `0x060711b2`、而 RM 自己的 PCIe init 已把
-`LINK_CONFIG_0` 改回 Gen2，于是真正那趟重放「写回读到的值」、没有产生均衡边沿。已验证
-的参考实现只跑一次，日志从 VBIOS 状态起步（`CYA=0x060731b2`）并以 `LnkSta=0x1104`
-收口。这条「只有一份」的不变量由 `tests/test_dynfb.py` 检查：E1 的 `CYA_0` 值只允许
-出现在一个载荷里。
+「只有一份」这条不变量的准确含义是**只有一份实现**，不是只走一趟。GSP bootstrap 那次
+实验（2026-11-18）证明的是：在另一处再放一份、中间被 RM 自己的 PCIe init 改回 Gen2，
+真正那趟就会「写回读到的值」、没有产生均衡边沿。因此 `cmp_pcie_retries`（默认 1）允许
+在同一处把整条阶梯再走一遍，代价是每卡每趟多几百毫秒，而重走前会先把 `CYA_0` bit13 置回去
+——`0x060731b2`（VBIOS）与 `0x060711b2`（A100 DevInit 之后）的实测差值就是这一位，
+不置回去第二趟就只是在复述第一趟留下的字。该不变量由 `tests/test_dynfb.py` 检查：E1 的
+`CYA_0` 值只允许出现在一个载荷里，且边沿重新武装必须排在 E1 重放之前。
+
+### 为什么台阶必须两端同时抬（AMD root port）
+
+台架的卡挂在 PEX880xx 交换芯片下游口，那种口对「只有卡单方面改速率字段」的重训不敏感，
+所以单边版本的 Phase A 在台架两次冷启动都能收口在 Gen4。EPYC 服务器（卡 `41:00.0`，
+上游 `40:03.1` AMD root port，驱动 615.71.09）不掩盖这件事：root port 遵守写进它
+`LNKCTL2` 的目标速率，而前一步 Gen2 重训刚把它钉在 Gen2，于是链路停在 5 GT/s，E1 重放
+打在还没离开 5 GT/s 的 PHY 上，Phase C 的 5→16 GT/s 直跳按已知规律失败，本次开机被
+`nv_cmp170hx_retrain_gen2()` 钉回 Gen2。当时现场是用一个 companion unit 补救：先带
+`cmp_pcie_gen=3` 与每卡 `RMPcieLinkSpeed=0x5` 重载一次驱动，双端确认 8 GT/s 后再按原
+配置重载一次，40 秒左右双端 16 GT/s。它真正提供的是「Gen4 那一趟从已收口的 8 GT/s
+起步」，而不是重载本身——两端同时抬的 Gen3 台阶就是把这一件事搬回驱动里，companion
+unit 不再必需（留着也无害：卡已在 Gen4 时它会直接退出）。台架侧的行为未变，EPYC 侧的
+效果需在真机以 `dmesg | grep 'CMP Gen'` 与双端 `LnkSta` 复核。
 
 总开关默认打开（写 `cmp_pcie_gen=0` 并把 `RMPcieLinkSpeed` 抬到 `0xF`），
 `--no-gen4`（等同 `CMPUNLOCKER_EXPERIMENTAL_GEN4=0`）才是把每张卡钉在 Gen2，与本特性
