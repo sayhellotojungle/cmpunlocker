@@ -400,8 +400,11 @@ card itself, so any slot works and cards can be mixed freely.
   port honours the Gen2 target speed the Gen2 retrain leaves on it, so the E1 block was
   replayed onto a PHY still at 5 GT/s. What worked there was a companion unit reloading
   the driver, whose real contribution was a first pass that left the link settled at
-  8 GT/s — the property the both-ended rung now provides without the reload, at the cost
-  of a few hundred ms per card per attempt at init.
+  8 GT/s — the property the both-ended rung now provides without the reload. A card
+  already at its target is left alone, which costs nothing; a card that has to walk
+  the ladder costs about half a second of init when the walk works and up to about
+  three seconds per walk when the link refuses, `cmp_pcie_retries` clamping the walk
+  count to 0-4 because this runs with the RM API lock held.
 
 Both switches are on for a normal install, and both are part of the build cache, so
 `--no-80g` and `--no-gen4` are rebuilds rather than reconfigurations. `--no-80g`, or the

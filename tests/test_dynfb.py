@@ -153,6 +153,16 @@ class DynfbFiles(unittest.TestCase):
         self.assertGreater(edge, 0, "the retry has to produce an edge, not a restate")
         self.assertLess(edge, e1)
         self.assertIn("cmp_pcie_retries", body, "and the retry count is an operator's knob")
+        # The E1 block is programmed while the link is up, so it can be what drops
+        # the link; the hook looks again rather than assuming the rung held.
+        self.assertIn(
+            "nv_cmp170hx_link_speed(gpu, upstream, &link_status, &partner_status) < 3",
+            body, "the rung is re-checked after the PHY-init block, not just before it")
+        # And a card already at its target is left alone: a warm reboot can train the
+        # link without this hook, and retraining a working link is a cost with no
+        # buyer.
+        self.assertIn("link already there", read(DYNFB / "hooks" / "nv_gen4.c"),
+                      "a link at its target does not get walked")
 
     def test_the_phy_init_block_is_replayed_exactly_once(self):
         """Two copies of the E1 block cannot add up to a faster link.

@@ -242,6 +242,10 @@ for sysdev in /sys/bus/pci/devices/*/device; do
         # lower speed is not broken (the port above it may cap it, and a Gen3 slot is
         # a legitimate answer), but it is worth one honest column: that card's
         # bring-up did not reach what the card may ask for, and the driver said why.
+        # CAP_EXP+2c is Link Capabilities 2, whose bits [7:1] are the Supported Link
+        # Speeds Vector: bit 4 (0x10) set means the card's fuses allow Gen4.  Note the
+        # offset, it is one of the ones people misremember: +24 is Device
+        # Capabilities 2, +30 is Link Control 2.
         cap2="$(setpci -s "${bdf}" CAP_EXP+2c.l 2>/dev/null || true)"
         if [[ "${cap2}" =~ ^[0-9a-fA-F]{8}$ ]] && (( 0x${cap2} & 0x10 )) &&
            (( generation < 4 )); then

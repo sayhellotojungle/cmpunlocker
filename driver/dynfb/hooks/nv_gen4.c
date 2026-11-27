@@ -84,6 +84,13 @@
  * exactly how the GSP-bootstrap copy managed to do nothing. */
 #define CMP_CYA0_PHY_INIT_EDGE    (1U << 13)
 
+/* 50 ms per poll.  A retrain aimed at Gen3 runs no equalisation handshake, so the
+ * rung gets 600 ms; the aim at the target runs the 16 GT/s equalisation phases and
+ * gets 2 s.  Both are upper bounds on a retrain that usually lands in the first
+ * poll or two: this runs inside device init, with the RM API lock held. */
+#define CMP_RETRAIN_POLLS_GEN3    12
+#define CMP_RETRAIN_POLLS_TARGET  40
+
 int cmp_pcie_gen = 2;
 module_param(cmp_pcie_gen, int, 0644);
 MODULE_PARM_DESC(cmp_pcie_gen,
@@ -133,9 +140,11 @@ nv_cmp170hx_advertised_gen(struct pci_dev *dev)
 }
 
 /* What the link runs at right now: the slower of the two ends' LnkSta speed fields,
- * because a link is exactly as fast as its slowest port.  0 if either end cannot be
- * read, -1 if the GPU's own config space is gone. *status and *partner_status carry
- * the raw words for the log. */
+ * because a link is exactly as fast as its slowest port.  A port that does not answer
+ * (all-ones is normal for the few hundred ms a retrain takes) is not a port that
+ * reported a slower speed, so it is left out of the answer and marked 0xffff in the
+ * word the log prints rather than being given the GPU's own value for company.
+ * Returns -1 only when the GPU's own config space is gone. */
 static int
 nv_cmp170hx_link_speed(struct pci_dev *gpu, struct pci_dev *upstream,
                        u16 *status, u16 *partner_status)
@@ -161,9 +170,7 @@ nv_cmp170hx_link_speed(struct pci_dev *gpu, struct pci_dev *upstream,
     }
     else
     {
-        // A port that will not answer its own status word has not made the link
-        // slower, and the GPU's answer is still the speed traffic runs at.
-        *partner_status = *status;
+        *partner_status = 0xffffU;
     }
 
     return speed;
@@ -330,7 +337,7 @@ nv_cmp170hx_gen4_post(nv_state_t *nv)
     void __iomem *bar0 = NULL;
     u16 link_status = 0, partner_status = 0;
     u32 v, rate_code, target, fused, partner;
-    int ret = 0, attempt, tries, trained;
+    int ret = 0, attempt, retries, tries, trained;
 
     if ((gpu == NULL) || (gpu->device != 0x20c2))
     {
@@ -379,9 +386,34 @@ nv_cmp170hx_gen4_post(nv_state_t *nv)
     // the only thing it is used for.
     partner = (u32)nv_cmp170hx_advertised_gen(upstream);
 
+    // A warm reboot, or a BIOS that trained the link itself, can leave the card at
+    // its target before this hook runs.  Retraining a link that is already where it
+    // belongs costs the walk and buys nothing, and it is a thing a host does not
+    // forgive once the workload is about to start.
+    trained = nv_cmp170hx_link_speed(gpu, upstream, &link_status, &partner_status);
+    if (trained == (int)target)
+    {
+        NV_DEV_PRINTF(NV_DBG_INFO, nv,
+                      "CMP Gen%u: link already there (LnkSta=0x%04x port LnkSta=0x%04x)\n",
+                      target, link_status, partner_status);
+        return;
+    }
+
     // LINK_CONFIG_0[19:18], reverse encoded (see above).
     rate_code = (cmp_pcie_rate > 0) ? (u32)cmp_pcie_rate : ((target >= 4) ? 0U : 1U);
-    tries = 1 + ((cmp_pcie_retries > 0) ? cmp_pcie_retries : 0);
+
+    // This runs from device init, holding the RM API lock, and each walk sleeps.
+    // A hand-written 1000 on the kernel command line would be minutes per card.
+    retries = cmp_pcie_retries;
+    if (retries < 0)
+    {
+        retries = 0;
+    }
+    else if (retries > 4)
+    {
+        retries = 4;
+    }
+    tries = 1 + retries;
 
     bar0 = ioremap(pci_resource_start(gpu, 0), 0x90000);
     if (bar0 == NULL)
@@ -398,16 +430,18 @@ nv_cmp170hx_gen4_post(nv_state_t *nv)
 
     for (attempt = 1; attempt <= tries; attempt++)
     {
-        if ((attempt > 1) && (cmp_pcie_e1 != 0))
+        if (attempt > 1)
         {
-            // The previous walk left CYA_0 holding the A100 value, so replaying it
-            // would write back the word that is already there.  Put the VBIOS bit
-            // back first and the replay below is an edge again, not a restate.
-            v = readl(bar0 + 0x8c2c0);
-            writel(v | CMP_CYA0_PHY_INIT_EDGE, bar0 + 0x8c2c0);
-            NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
-                          "CMP Gen%u: walk %d of %d, CYA=0x%08x\n",
-                          target, attempt, tries, readl(bar0 + 0x8c2c0));
+            NV_DEV_PRINTF(NV_DBG_ERRORS, nv, "CMP Gen%u: walk %d of %d\n",
+                          target, attempt, tries);
+            if (cmp_pcie_e1 != 0)
+            {
+                // The previous walk left CYA_0 holding the A100 value, so replaying
+                // it would write back the word that is already there.  Put the VBIOS
+                // bit back first and the replay below is an edge again, not a restate.
+                v = readl(bar0 + 0x8c2c0);
+                writel(v | CMP_CYA0_PHY_INIT_EDGE, bar0 + 0x8c2c0);
+            }
         }
 
         // ---- Phase A: the Gen3 step, asked of both ends of the link ----
@@ -421,7 +455,7 @@ nv_cmp170hx_gen4_post(nv_state_t *nv)
         msleep(50);
 
         trained = nv_cmp170hx_link_retrain(gpu, upstream, 3, &link_status,
-                                           &partner_status, &ret, 20);
+                                           &partner_status, &ret, CMP_RETRAIN_POLLS_GEN3);
         if (trained < 3)
         {
             NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
@@ -439,9 +473,15 @@ nv_cmp170hx_gen4_post(nv_state_t *nv)
 
         if ((u32)trained >= target)
         {
-            // A card asked for, or fused to, Gen3: the rung is the target, and the
-            // E1 block below exists to make 16 GT/s trainable, so there is nothing
-            // left to do here.
+            // A card asked for, or fused to, Gen3: the rung is the target, and the E1
+            // block below exists to make 16 GT/s trainable, so there is nothing left
+            // to do here.  The one thing the E1 path would have honoured and this
+            // path skips is an explicit rate-field override, so write that.
+            if (cmp_pcie_rate > 0)
+            {
+                v = readl(bar0 + 0x8c040);
+                writel((v & ~0x000c0000U) | (rate_code << 18), bar0 + 0x8c040);
+            }
             NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
                           "CMP Gen%u: link trained (LnkSta=0x%04x port LnkSta=0x%04x)\n",
                           target, link_status, partner_status);
@@ -484,7 +524,7 @@ nv_cmp170hx_gen4_post(nv_state_t *nv)
         if (nv_cmp170hx_link_speed(gpu, upstream, &link_status, &partner_status) < 3)
         {
             trained = nv_cmp170hx_link_retrain(gpu, upstream, 3, &link_status,
-                                               &partner_status, &ret, 20);
+                                               &partner_status, &ret, CMP_RETRAIN_POLLS_GEN3);
             if (trained < 3)
             {
                 NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
@@ -499,7 +539,7 @@ nv_cmp170hx_gen4_post(nv_state_t *nv)
         nv_cmp170hx_request_equalization(gpu);
         nv_cmp170hx_request_equalization(upstream);
         trained = nv_cmp170hx_link_retrain(gpu, upstream, target, &link_status,
-                                           &partner_status, &ret, 40);
+                                           &partner_status, &ret, CMP_RETRAIN_POLLS_TARGET);
         if (trained == (int)target)
         {
             NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
@@ -534,7 +574,7 @@ nv_cmp170hx_gen4_post(nv_state_t *nv)
             writel((v & ~0x000c0000U) | (((4U - (u32)trained) << 18) & 0x000c0000U),
                    bar0 + 0x8c040);
             trained = nv_cmp170hx_link_retrain(gpu, upstream, (u32)trained,
-                                               &link_status, &partner_status, &ret, 20);
+                                               &link_status, &partner_status, &ret, CMP_RETRAIN_POLLS_GEN3);
             if (trained >= 3)
             {
                 NV_DEV_PRINTF(NV_DBG_ERRORS, nv,

@@ -116,5 +116,12 @@ def test_verify_owns_the_link_floor():
     verify = (repo.ROOT / "verify.sh").read_text()
     assert "generation >= 2" in verify, "Gen2 is the floor"
     assert "GEN${generation} OK" in verify, "whatever was negotiated above it is reported"
+    # Above the floor, the card's own ceiling is worth reporting rather than hiding,
+    # and the register that states it is Link Capabilities 2 at CAP_EXP+2c: read some
+    # other offset and the extra column is a guess printed with confidence.
+    assert "Gen4 missed" in verify, ("a card whose fuses allow more than its link "
+                                     "carries is named, without failing the run")
+    assert 'CAP_EXP+2c.l' in verify, ("the speed vector comes from Link Capabilities 2, "
+                                      "not from a remembered offset")
     code = "\n".join(line.split("#")[0] for line in verify.splitlines())
     assert "service.sh" not in code, "the link check cannot be delegated to a deleted file"
