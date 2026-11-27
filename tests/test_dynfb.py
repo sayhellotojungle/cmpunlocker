@@ -103,9 +103,10 @@ class DynfbFiles(unittest.TestCase):
         so it is checked rather than asserted.
         """
         body = masked(read(DYNFB / "hooks" / "nv_gen4.c"))
-        # Definition, the ask at the fused target, and the retrain aimed at whatever
-        # the link reached: two passes at most, and the second only after a partial.
-        self.assertEqual(body.count("nv_cmp170hx_link_retrain("), 3)
+        # Definition, the Gen3 rung, that rung again if the E1 block dropped the
+        # link, the ask at the fused target, and the retrain aimed at whatever the
+        # link reached.  Every one of them is a rung of the ladder, not a retry.
+        self.assertEqual(body.count("nv_cmp170hx_link_retrain("), 5)
         guard = body.find("if (trained >= 3)")
         fallback = body.find("fallback:")
         hammer = body.find("nv_cmp170hx_retrain_gen2(nv);")
@@ -119,6 +120,39 @@ class DynfbFiles(unittest.TestCase):
         # retrain: the card's own rate fields are rewritten to the trained speed.
         self.assertIn("0x8c1c0", body[guard:fallback])
         self.assertIn("0x8c040", body[guard:fallback])
+
+    def test_the_gen3_rung_is_asked_of_both_ends_before_the_phy_init_block(self):
+        """The first rung has to be a rung the partner is standing on too.
+
+        Measured on an EPYC server (card 41:00.0 on root port 40:03.1): the pass
+        that raised only the card's own rate fields left the link at 5 GT/s, because
+        the Gen2 retrain two lines earlier had pinned the port's target speed to
+        Gen2 and an AMD root port honours that.  The E1 block then replayed onto a
+        PHY that was still at 5 GT/s, the 5 -> 16 GT/s request missed, and the card
+        was left on Gen2 for the uptime; the companion unit that appeared on that
+        host worked because its second pass started from a link settled at 8 GT/s.
+        So the Gen3 rung is asked of both ends, confirmed at both ends, and sits
+        before the E1 block rather than beside it.
+        """
+        body = masked(read(DYNFB / "hooks" / "nv_gen4.c"))
+        e1 = body.find("0x060711b2")
+        rung = body.find("nv_cmp170hx_link_retrain(gpu, upstream, 3,")
+        self.assertGreater(rung, 0, "the Gen3 rung is a retrain, not a register write")
+        self.assertLess(rung, e1, "8 GT/s first, the PHY-init block second")
+        # Both ends: the slower port is what the link reports, so the rung is only
+        # taken as held when the port above the card says 8 GT/s too.
+        self.assertIn("upstream, PCI_EXP_LNKSTA", body[:rung],
+                      "the rung's confirmation reads the partner's link status")
+        rung_guard = body.find("if (trained < 3)")
+        self.assertGreater(rung_guard, rung, "the rung's own answer is looked at")
+        self.assertLess(rung_guard, e1, "and E1 is not replayed onto a link that missed it")
+        # A second walk of the ladder has to re-arm the equalisation edge, or it
+        # writes back the CYA_0 value the first walk left there.  The GSP-bootstrap
+        # copy failed for exactly that reason.
+        edge = body.find("writel(v | CMP_CYA0_PHY_INIT_EDGE")
+        self.assertGreater(edge, 0, "the retry has to produce an edge, not a restate")
+        self.assertLess(edge, e1)
+        self.assertIn("cmp_pcie_retries", body, "and the retry count is an operator's knob")
 
     def test_the_phy_init_block_is_replayed_exactly_once(self):
         """Two copies of the E1 block cannot add up to a faster link.
