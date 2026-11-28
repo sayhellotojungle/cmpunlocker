@@ -103,8 +103,8 @@ class DynfbFiles(unittest.TestCase):
         so it is checked rather than asserted.
         """
         body = masked(read(DYNFB / "hooks" / "nv_gen4.c"))
-        # Definition, the ask at the fused target, and the retrain aimed at whatever
-        # the link reached: two passes at most, and the second only after a partial.
+        # Definition, the ask at the fused target, and the retrain inside the settle:
+        # two passes at most, and the second only after a partial.
         self.assertEqual(body.count("nv_cmp170hx_link_retrain("), 3)
         guard = body.find("if (trained >= 3)")
         fallback = body.find("fallback:")
@@ -116,9 +116,53 @@ class DynfbFiles(unittest.TestCase):
         # would train Gen3 and then hammer it back down two lines later.
         self.assertIn("goto done", body[guard:fallback])
         # A link left at Gen3 must not still be told to chase Gen4 on every future
-        # retrain: the card's own rate fields are rewritten to the trained speed.
-        self.assertIn("0x8c1c0", body[guard:fallback])
-        self.assertIn("0x8c040", body[guard:fallback])
+        # retrain, so the branch goes through the settle and the settle is what
+        # rewrites the card's own rate fields to the trained speed.
+        self.assertIn("nv_cmp170hx_link_settle(", body[guard:fallback])
+        settle = body[body.find("nv_cmp170hx_link_settle(struct pci_dev"):]
+        settle = settle[:settle.find("\n}")]
+        self.assertIn("0x8c1c0", settle, "PL_LINK_RATE goes to the trained speed")
+        self.assertIn("0x8c040", settle, "and so does the LINK_CONFIG_0 rate field")
+
+    def test_the_gen2_recipe_waits_for_an_explicit_gen3(self):
+        """A Gen3 board with a Gen4-fused card does not belong on Gen2.
+
+        Reported from the field as "the board is Gen3 and the card ends up Gen2".  The
+        only request this hook sent was for the fused target, Gen4; the 16 GT/s
+        equalisation is refused, the link comes back at the speed the VBIOS left it at,
+        and the first version of this walked straight into the Gen2 recipe.  Nothing
+        above Gen2 had been refused, because nothing above Gen2 had been asked for on
+        its own terms.  The rung below the target gets that ask first.
+        """
+        body = masked(read(DYNFB / "hooks" / "nv_gen4.c"))
+        fallback = body.find("fallback:")
+        hammer = body.find("nv_cmp170hx_retrain_gen2(nv);")
+        ask = body.rfind("nv_cmp170hx_link_settle(gpu, upstream, bar0, 3,")
+        self.assertGreater(ask, 0, "the rung is asked for by name")
+        self.assertLess(ask, fallback, "before the Gen2 path, not after it")
+        self.assertGreater(hammer, ask)
+
+    def test_an_all_ones_link_status_is_not_a_trained_speed(self):
+        """A card that reads 0xffff did not report Gen15.
+
+        During the few hundred ms a retrain takes, config space reads answer all-ones
+        and pcie_capability_read_word() reports success.  0xffff & PCI_EXP_LNKSTA_CLS
+        is 0xf, which passes the `>= gen` test that decides whether the retrain worked,
+        so a read taken mid-Recovery was reported as the speed reached and the next
+        writes went to a target speed and rate fields whose encodings have no value
+        above Gen4.
+        """
+        body = masked(read(DYNFB / "hooks" / "nv_gen4.c"))
+        retrain = body[body.find("nv_cmp170hx_link_retrain(struct pci_dev"):]
+        retrain = retrain[:retrain.find("\n}")]
+        unreadable = retrain.find("if (*status == 0xffffU)")
+        self.assertGreater(unreadable, 0, "the all-ones read is taken back")
+        self.assertLess(unreadable, retrain.find("PCI_EXP_LNKSTA_CLS"),
+                        "before the speed field is read out of it")
+        self.assertIn("continue;", retrain[unreadable:],
+                      "and it is polled again rather than believed")
+        self.assertIn("int trained = 0;", retrain,
+                      "so the returned speed is a named one, not whatever was last read")
 
     def test_the_phy_init_block_is_replayed_exactly_once(self):
         """Two copies of the E1 block cannot add up to a faster link.

@@ -47,11 +47,14 @@
  *
  * A card that does not reach that target keeps whatever the link did train, down to
  * but not below Gen3, and only a link that cannot hold Gen3 goes back to the Gen2
- * recipe.  The target is the card's own ceiling, not the link's: on this bench the
- * burned card's fuses allow Gen4 while the bridge above it is a Gen3 link upstream,
- * so Gen3 is the steady state to aim the link at even when Phase C reports a miss.
- * Dragging a trained 8 GT/s link back to 5 GT/s because it is not 16 GT/s throws
- * away bandwidth for no safety.
+ * recipe.  "Cannot hold" is measured, not inferred from the target missing: the rung
+ * below the target is asked for on its own terms before that recipe runs, because the
+ * only request that would otherwise have gone out is the one for the target, and a
+ * board that turns 16 GT/s down may carry 8 GT/s perfectly well.  The target is the
+ * card's own ceiling, not the link's: on this bench the burned card's fuses allow Gen4
+ * while the bridge above it is a Gen3 link upstream, so Gen3 is the steady state to
+ * aim the link at even when Phase C reports a miss.  Dragging a trained 8 GT/s link
+ * back to 5 GT/s because it is not 16 GT/s throws away bandwidth for no safety.
  * ----------------------------------------------------------------------- */
 
 #ifndef PCI_EXP_LNKCTL2_TLS
@@ -99,9 +102,11 @@ nv_cmp170hx_fused_gen(struct pci_dev *gpu)
 
 /* Aim both ends of the link at gen and ask for a retrain, through config space,
  * because RM reports NV_ERR_NOT_SUPPORTED for a speed its SKU says the GPU cannot
- * do.  Returns what the link reports afterwards (1..4), 0 if it never trained at
- * that speed, or -1 if config space could not be read at all; *status is the raw
- * LnkSta either way. */
+ * do.  Returns what the link reports afterwards (1..4), 0 if it never named a speed,
+ * which includes a card that is still answering config reads with all ones, or -1 if
+ * config space could not be read at all; *status is the raw LnkSta either way.  0 is
+ * not a refusal, it is the link not having answered, which is why the caller keeps
+ * polling on it. */
 static int
 nv_cmp170hx_link_retrain(struct pci_dev *gpu, struct pci_dev *upstream, NvU32 gen,
                          u16 *status, int *err)
@@ -109,6 +114,7 @@ nv_cmp170hx_link_retrain(struct pci_dev *gpu, struct pci_dev *upstream, NvU32 ge
     u16 gpu_ctl2, upstream_ctl2, upstream_ctl;
     int attempt;
     int ret;
+    int trained = 0;
 
     // Never report a speed read on an earlier pass as this one's result.
     *status = 0;
@@ -152,13 +158,43 @@ nv_cmp170hx_link_retrain(struct pci_dev *gpu, struct pci_dev *upstream, NvU32 ge
         {
             continue;
         }
-        if ((*status & PCI_EXP_LNKSTA_CLS) >= (u16)gen)
+        // All ones is what a config read answers for the few hundred ms a retrain
+        // takes, and pcie_capability_read_word() reports that as success.  Its speed
+        // field is 0xf, so the read was being reported as "trained at Gen15": that
+        // clears the test below, the retrain was called a success while the link was
+        // still in Recovery, and whatever runs next programmed a target speed and rate
+        // fields whose encodings have no value above Gen4.  No speed named; poll again.
+        if (*status == 0xffffU)
+        {
+            continue;
+        }
+        trained = *status & PCI_EXP_LNKSTA_CLS;
+        if ((u32)trained >= gen)
         {
             break;
         }
     }
 
-    return (*status & PCI_EXP_LNKSTA_CLS);
+    return trained;
+}
+
+/* Bring the link to rest on a speed it has been asked for and reached: the card's own
+ * rate fields and both ends' target speed go to that speed, so a later retrain is not
+ * left chasing a speed this link has shown it cannot hold.  `speed` is 3 or 4, the only
+ * two the reverse-encoded LINK_CONFIG_0 field has room for.  Returns what the link
+ * reports afterwards; *status is the raw LnkSta either way. */
+static int
+nv_cmp170hx_link_settle(struct pci_dev *gpu, struct pci_dev *upstream,
+                        void __iomem *bar0, NvU32 speed, u16 *status, int *err)
+{
+    u32 v;
+
+    v = readl(bar0 + 0x8c1c0);                                       // PL_LINK_RATE
+    writel((v & ~0x000f0000U) | ((speed & 0xfU) << 16), bar0 + 0x8c1c0);
+    v = readl(bar0 + 0x8c040);                                       // LINK_CONFIG_0
+    writel((v & ~0x000c0000U) | (((4U - speed) << 18) & 0x000c0000U), bar0 + 0x8c040);
+
+    return nv_cmp170hx_link_retrain(gpu, upstream, speed, status, err);
 }
 
 static void
@@ -338,17 +374,17 @@ nv_cmp170hx_gen4_post(nv_state_t *nv)
         // card may do, not what the slot it sits in will carry.  Keep the speed it
         // reached and aim both ends, and the card's own rate fields, at it, so a
         // later retrain does not chase a speed this link has already shown it
-        // cannot hold.
+        // cannot hold.  Above four there is nothing to write: the target-speed field
+        // and the card's rate fields have no encoding past Gen4.
+        if (trained > 4)
+        {
+            trained = 4;
+        }
         NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
                       "CMP Gen%u: trained Gen%d not Gen%u (LnkSta=0x%04x); the link"
                       " above this card caps it, staying on Gen%d\n",
                       target, trained, target, link_status, trained);
-        v = readl(bar0 + 0x8c1c0);
-        writel((v & ~0x000f0000U) | ((u32)trained << 16), bar0 + 0x8c1c0);
-        v = readl(bar0 + 0x8c040);
-        writel((v & ~0x000c0000U) | (((4U - (u32)trained) << 18) & 0x000c0000U),
-               bar0 + 0x8c040);
-        trained = nv_cmp170hx_link_retrain(gpu, upstream, (u32)trained,
+        trained = nv_cmp170hx_link_settle(gpu, upstream, bar0, (u32)trained,
                                           &link_status, &ret);
         if (trained >= 3)
         {
@@ -356,12 +392,33 @@ nv_cmp170hx_gen4_post(nv_state_t *nv)
                           "CMP Gen%d: settled (LnkSta=0x%04x)\n", trained, link_status);
             goto done;
         }
+        // The link will not even hold the speed it trained a moment ago; nothing
+        // above Gen2 is available on this board.
+        goto fallback;
+    }
+
+    // The aim at the target was refused and the link came back at the speed the VBIOS
+    // left it at.  Nothing above Gen2 has been refused here, because nothing above Gen2
+    // was ever asked for on its own terms: the only request out was the one for the
+    // target.  So the rung below the target gets asked before the Gen2 recipe is, and
+    // a board that carries 8 GT/s is not a board that belongs at 5 GT/s.  This is also
+    // the ask that catches a root port the Gen2 retrain pinned low, which is what a
+    // board with a Gen3 slot and a Gen4-fused card needs.
+    NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
+                  "CMP Gen%u: Gen%u reached nothing (LnkSta=0x%04x); asking for Gen3"
+                  " before the Gen2 recipe\n", target, target, link_status);
+    trained = nv_cmp170hx_link_settle(gpu, upstream, bar0, 3, &link_status, &ret);
+    if (trained >= 3)
+    {
+        NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
+                      "CMP Gen%d: settled (LnkSta=0x%04x)\n", trained, link_status);
+        goto done;
     }
 
 fallback:
-    // Nothing above Gen2 trained, or config space could not be read at all: put the
-    // card back on the link every CMP 170HX is known to work at, which is the one
-    // our Gen2 recipe trains.
+    // Nothing above Gen2 held, the rung below the target included, or config space
+    // could not be read at all: put the card back on the link every CMP 170HX is known
+    // to work at, which is the one our Gen2 recipe trains.
     NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
                   "CMP Gen%u: nothing above Gen2 held (LnkSta=0x%04x), falling back to Gen2\n",
                   target, link_status);

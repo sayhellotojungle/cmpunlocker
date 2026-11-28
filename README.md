@@ -377,7 +377,15 @@ card itself, so any slot works and cards can be mixed freely.
   A card that does not reach its target keeps the speed the link did train, down to but
   not below Gen3, and both ends of the link plus the card's own rate fields are set to
   the speed it holds, so a later retrain does not request a speed the slot cannot carry.
-  Only a link that cannot hold Gen3 returns to the Gen2 path. The fuse value states what
+  Only a link that cannot hold Gen3 returns to the Gen2 path, and that floor covers the
+  fallback too: an aim at the target that is refused without the link ever naming a
+  speed asks for Gen3 on its own before the Gen2 recipe runs, because the only request
+  that had gone out was for the target, and a board that carries 8 GT/s is not a board
+  that belongs at 5 GT/s. A `LnkSta` of `0xffff` is neither a speed nor a refusal:
+  config reads answer all-ones for the few hundred ms a retrain takes,
+  `pcie_capability_read_word()` calls that success, and the speed field of `0xffff` is
+  `0xf` - a link "trained at Gen15" satisfies every `>= Gen3` test in the walk and then
+  programs a target speed the encoding has no room for. The fuse value states what
   a card may request, not what the board it sits in will carry, so the two can differ.
   On the bench, two cold boots with the feature enabled both reached the top tier
   (`CMP Gen4: link trained (LnkSta=0x1104)`, upstream bridge `0x2104`) and the link was
