@@ -51,7 +51,11 @@
  * burned card's fuses allow Gen4 while the bridge above it is a Gen3 link upstream,
  * so Gen3 is the steady state to aim the link at even when Phase C reports a miss.
  * Dragging a trained 8 GT/s link back to 5 GT/s because it is not 16 GT/s throws
- * away bandwidth for no safety.
+ * away bandwidth for no safety.  "Down to but not below Gen3" is a floor on the
+ * *fallback* as much as on the partial success: the highest rung a walk stood on is
+ * remembered, and a later aim that misses and drags the link below it settles the
+ * link back on that rung rather than handing the card to the Gen2 recipe.  A walk
+ * that never stood above Gen2 is the only one that lands on Gen2.
  *
  * Every rung of that ladder is now asked of both ends and confirmed on both ends,
  * and that is the part a one-sided version gets away with on some boards and not on
@@ -144,7 +148,9 @@ nv_cmp170hx_advertised_gen(struct pci_dev *dev)
  * (all-ones is normal for the few hundred ms a retrain takes) is not a port that
  * reported a slower speed, so it is left out of the answer and marked 0xffff in the
  * word the log prints rather than being given the GPU's own value for company.
- * Returns -1 only when the GPU's own config space is gone. */
+ * Returns what the slowest answering end reports (1..4), 0 when no end named a speed,
+ * which includes a card that reads all-ones, or -1 when the GPU's own config space
+ * could not be read at all. */
 static int
 nv_cmp170hx_link_speed(struct pci_dev *gpu, struct pci_dev *upstream,
                        u16 *status, u16 *partner_status)
@@ -159,18 +165,31 @@ nv_cmp170hx_link_speed(struct pci_dev *gpu, struct pci_dev *upstream,
         *status = 0;
         return -1;
     }
-    speed = *status & PCI_EXP_LNKSTA_CLS;
 
-    if (pcie_capability_read_word(upstream, PCI_EXP_LNKSTA, partner_status) == 0)
-    {
-        if ((*partner_status & PCI_EXP_LNKSTA_CLS) < speed)
-        {
-            speed = *partner_status & PCI_EXP_LNKSTA_CLS;
-        }
-    }
-    else
+    if (pcie_capability_read_word(upstream, PCI_EXP_LNKSTA, partner_status) != 0)
     {
         *partner_status = 0xffffU;
+    }
+
+    // The card's own all-ones read has to be taken back the same way the partner's
+    // is.  pcie_capability_read_word() reports success for it, and the speed field of
+    // 0xffff is 0xf, so "trained at Gen15" satisfies every `>= gen` and `>= 3` test in
+    // this file: the walk then declared the rung reached while the link was still in
+    // Recovery, and aimed LNKCTL2 and the card's rate fields at an encoding that has
+    // no value above Gen4.  The partner's all-ones is harmless by construction,
+    // because 15 never wins the min() below, which is why only this end needs the
+    // check.  The partner is still read first: a log line saying the port reported
+    // 8 GT/s while the card was not answering is worth having.
+    if (*status == 0xffffU)
+    {
+        return 0;
+    }
+
+    speed = *status & PCI_EXP_LNKSTA_CLS;
+
+    if ((*partner_status & PCI_EXP_LNKSTA_CLS) < speed)
+    {
+        speed = *partner_status & PCI_EXP_LNKSTA_CLS;
     }
 
     return speed;
@@ -192,9 +211,10 @@ nv_cmp170hx_request_equalization(struct pci_dev *dev)
 
 /* Aim both ends of the link at gen and ask for a retrain, through config space,
  * because RM reports NV_ERR_NOT_SUPPORTED for a speed its SKU says the GPU cannot
- * do.  Returns what the slower of the two ends reports afterwards (1..4), 0 if the
- * link never reported at all, or -1 if config space could not be written at all;
- * *status and *partner_status are the raw LnkSta words either way. */
+ * do.  Returns what the slower of the two ends reports afterwards (1..4), 0 if neither
+ * end has named a speed yet, or -1 if config space could not be written at all;
+ * *status and *partner_status are the raw LnkSta words either way.  0 is not a refusal:
+ * it is the link not having answered, which is why the caller keeps polling on it. */
 static int
 nv_cmp170hx_link_retrain(struct pci_dev *gpu, struct pci_dev *upstream, NvU32 gen,
                          u16 *status, u16 *partner_status, int *err, int polls)
@@ -268,6 +288,31 @@ nv_cmp170hx_link_retrain(struct pci_dev *gpu, struct pci_dev *upstream, NvU32 ge
     return trained;
 }
 
+/* Bring the link to rest on a speed it has already been seen to train.  The card's own
+ * rate fields and both ends' target speed go to that speed, so a later retrain is not
+ * left chasing a speed this link has shown it cannot hold, and the link is retrained at
+ * it.  `speed` is 3 or 4: above Gen4 the target-speed field and the card's rate fields
+ * have no encoding to write, so the caller clamps before coming here.  Returns what the
+ * link reports afterwards; *status and *partner_status are the raw LnkSta words either
+ * way. */
+static int
+nv_cmp170hx_link_settle(struct pci_dev *gpu, struct pci_dev *upstream,
+                        void __iomem *bar0, NvU32 speed,
+                        u16 *status, u16 *partner_status, int *err)
+{
+    u32 v;
+
+    v = readl(bar0 + 0x8c1c0);                                       // PL_LINK_RATE
+    writel((v & ~0x000f0000U) | ((speed & 0xfU) << 16), bar0 + 0x8c1c0);
+    v = readl(bar0 + 0x8c040);                                       // LINK_CONFIG_0
+    writel((v & ~0x000c0000U) | (((4U - speed) << 18) & 0x000c0000U), bar0 + 0x8c040);
+
+    // Aim at a rung, not above it: the equalisation phases belong to 16 GT/s, and a
+    // settle that has to wait for them is waiting for something this link refused.
+    return nv_cmp170hx_link_retrain(gpu, upstream, speed, status, partner_status,
+                                    err, CMP_RETRAIN_POLLS_GEN3);
+}
+
 /* Phase A: the Gen3 step.  Nothing above Gen2 trains from 5 GT/s, so the card's own
  * rate fields go to Gen3 and the LTSSM is taken through Recovery; by the end of it
  * the PHY is running and the E1 block has something to work on. */
@@ -338,6 +383,10 @@ nv_cmp170hx_gen4_post(nv_state_t *nv)
     u16 link_status = 0, partner_status = 0;
     u32 v, rate_code, target, fused, partner;
     int ret = 0, attempt, retries, tries, trained;
+    // The highest rung any pass of this walk confirmed at both ends.  It is what the
+    // fallback is allowed to settle on, and it starts at nothing: a card that never
+    // stood above Gen2 is the card the Gen2 recipe exists for.
+    int held = 0;
 
     if ((gpu == NULL) || (gpu->device != 0x20c2))
     {
@@ -471,6 +520,11 @@ nv_cmp170hx_gen4_post(nv_state_t *nv)
             continue;
         }
 
+        // The link stands on this rung at both ends, and from here to the end of this
+        // function the card has that rung under it: an aim above it that misses does
+        // not get to hand the card to the Gen2 recipe on the way down.
+        held = trained;
+
         if ((u32)trained >= target)
         {
             // A card asked for, or fused to, Gen3: the rung is the target, and the E1
@@ -551,6 +605,9 @@ nv_cmp170hx_gen4_post(nv_state_t *nv)
         {
             NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
                           "CMP Gen%u: config space access failed (%d)\n", target, ret);
+            // Not a refused speed, a card that stopped answering.  It is not owed
+            // another retrain, so it does not get the settle below either.
+            held = 0;
             goto fallback;
         }
 
@@ -561,20 +618,20 @@ nv_cmp170hx_gen4_post(nv_state_t *nv)
             // card may do, not what the slot it sits in will carry.  Keep the speed it
             // reached and aim both ends, and the card's own rate fields, at it, so a
             // later retrain does not chase a speed this link has already shown it
-            // cannot hold.
+            // cannot hold.  Above four there is nothing to write: the target-speed
+            // field and the card's rate fields have no encoding past Gen4.
+            if (trained > 4)
+            {
+                trained = 4;
+            }
             NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
                           "CMP Gen%u: trained Gen%d not Gen%u (LnkSta=0x%04x port"
                           " LnkSta=0x%04x); the link above this card caps it,"
                           " staying on Gen%d\n",
                           target, trained, target, link_status, partner_status,
                           trained);
-            v = readl(bar0 + 0x8c1c0);
-            writel((v & ~0x000f0000U) | ((u32)trained << 16), bar0 + 0x8c1c0);
-            v = readl(bar0 + 0x8c040);
-            writel((v & ~0x000c0000U) | (((4U - (u32)trained) << 18) & 0x000c0000U),
-                   bar0 + 0x8c040);
-            trained = nv_cmp170hx_link_retrain(gpu, upstream, (u32)trained,
-                                               &link_status, &partner_status, &ret, CMP_RETRAIN_POLLS_GEN3);
+            trained = nv_cmp170hx_link_settle(gpu, upstream, bar0, (u32)trained,
+                                              &link_status, &partner_status, &ret);
             if (trained >= 3)
             {
                 NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
@@ -582,8 +639,10 @@ nv_cmp170hx_gen4_post(nv_state_t *nv)
                               trained, link_status, partner_status);
                 goto done;
             }
-            // The link will not even hold the speed it just trained; nothing above
-            // Gen2 is available on this board.
+            // The link will not even hold the speed it trained a moment ago, and that
+            // speed has now been asked for and refused: nothing above Gen2 is available
+            // on this board.
+            held = 0;
             goto fallback;
         }
 
@@ -594,6 +653,29 @@ nv_cmp170hx_gen4_post(nv_state_t *nv)
     }
 
 fallback:
+    // The aim above the rung failed and took the link down with it, or the rung was
+    // never taken again after an earlier pass had it.  A walk that stood on 8 GT/s at
+    // both ends and was then refused 16 GT/s does not belong on the Gen2 recipe: the
+    // board was measured to carry the lower rung, and the refuse says nothing about it.
+    // Settling rewrites the card's rate fields as well as the target speed, so a later
+    // retrain is not left aiming at the speed this link refused.
+    if (held >= 3)
+    {
+        NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
+                      "CMP Gen%u: Gen%u was held at both ends before Gen%u was refused;"
+                      " settling on Gen%u (LnkSta=0x%04x port LnkSta=0x%04x)\n",
+                      target, held, target, held, link_status, partner_status);
+        trained = nv_cmp170hx_link_settle(gpu, upstream, bar0, (u32)held, &link_status,
+                                          &partner_status, &ret);
+        if (trained >= held)
+        {
+            NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
+                          "CMP Gen%d: settled (LnkSta=0x%04x port LnkSta=0x%04x)\n",
+                          trained, link_status, partner_status);
+            goto done;
+        }
+    }
+
     // Nothing above Gen2 trained, or config space could not be read at all: put the
     // card back on the link every CMP 170HX is known to work at, which is the one
     // our Gen2 recipe trains.

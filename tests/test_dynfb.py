@@ -104,8 +104,8 @@ class DynfbFiles(unittest.TestCase):
         """
         body = masked(read(DYNFB / "hooks" / "nv_gen4.c"))
         # Definition, the Gen3 rung, that rung again if the E1 block dropped the
-        # link, the ask at the fused target, and the retrain aimed at whatever the
-        # link reached.  Every one of them is a rung of the ladder, not a retry.
+        # link, the ask at the fused target, and the retrain inside the settle.  Every
+        # one of them is a rung of the ladder, not a retry.
         self.assertEqual(body.count("nv_cmp170hx_link_retrain("), 5)
         guard = body.find("if (trained >= 3)")
         fallback = body.find("fallback:")
@@ -117,9 +117,63 @@ class DynfbFiles(unittest.TestCase):
         # would train Gen3 and then hammer it back down two lines later.
         self.assertIn("goto done", body[guard:fallback])
         # A link left at Gen3 must not still be told to chase Gen4 on every future
-        # retrain: the card's own rate fields are rewritten to the trained speed.
-        self.assertIn("0x8c1c0", body[guard:fallback])
-        self.assertIn("0x8c040", body[guard:fallback])
+        # retrain, so the branch has to go through the settle, and the settle is what
+        # rewrites the card's own rate fields to the trained speed.
+        self.assertIn("nv_cmp170hx_link_settle(", body[guard:fallback])
+        settle = body[body.find("nv_cmp170hx_link_settle(struct pci_dev"):]
+        settle = settle[:settle.find("\n}")]
+        self.assertIn("0x8c1c0", settle, "PL_LINK_RATE goes to the trained speed")
+        self.assertIn("0x8c040", settle, "and so does the LINK_CONFIG_0 rate field")
+
+    def test_a_held_rung_is_not_given_back_by_the_gen2_fallback(self):
+        """The floor is the highest rung the walk stood on, not Gen2.
+
+        Reported on a Gen3 board: the card's fuses allow Gen4, so the hook aims Phase C
+        at Gen4, the 16 GT/s equalisation is refused and the link comes back at 5 GT/s,
+        and the first version of this fell through to the Gen2 recipe.  It had confirmed
+        8 GT/s at both ends twice in that same walk.  The board was measured to carry
+        Gen3, the refuse says nothing about that rung, and dropping to Gen2 is the same
+        bandwidth thrown away for no safety the bench measurement was written against.
+        """
+        body = masked(read(DYNFB / "hooks" / "nv_gen4.c"))
+        rung_held = body.find("held = trained;")
+        e1 = body.find("0x060711b2")
+        fallback = body.find("fallback:")
+        hammer = body.find("nv_cmp170hx_retrain_gen2(nv);")
+        # The rung is recorded where it is confirmed, before the PHY-init block, or the
+        # fallback has nothing to settle on.
+        self.assertGreater(rung_held, 0, "the confirmed rung is recorded")
+        self.assertLess(rung_held, e1, "recorded when it is stood on, not after the aim")
+        tail = body[fallback:hammer]
+        self.assertIn("if (held >= 3)", tail,
+                      "the fallback looks at the rung before handing the card to Gen2")
+        self.assertIn("nv_cmp170hx_link_settle(", tail,
+                      "and it settles the link there rather than merely hoping")
+        # A card whose config space stopped answering gets no further retrain, and a
+        # link that refused the speed it had just trained is not owed another aim.
+        self.assertEqual(body.count("held = 0;") - body.count("int held = 0;"), 2,
+                         "both paths that invalidate the rung say so")
+
+    def test_an_all_ones_link_status_is_not_a_trained_speed(self):
+        """A card that reads 0xffff did not report Gen15.
+
+        During the few hundred ms a retrain takes, config space reads answer all-ones
+        and pcie_capability_read_word() reports success.  0xffff & PCI_EXP_LNKSTA_CLS is
+        0xf, which passes every `>= gen` test in the walk, so a read taken mid-Recovery
+        was reported as the rung reached: the walk then declared success while the link
+        was still at 5 GT/s and wrote a target speed and rate fields the encodings have
+        no value for.  The partner's all-ones was harmless, because 15 never wins a
+        min(); only the card's own end needed taking back.
+        """
+        body = masked(read(DYNFB / "hooks" / "nv_gen4.c"))
+        speed_fn = body[body.find("nv_cmp170hx_link_speed(struct pci_dev"):]
+        speed_fn = speed_fn[:speed_fn.find("\n}")]
+        unreadable = speed_fn.find("if (*status == 0xffffU)")
+        self.assertGreater(unreadable, 0, "the card's all-ones read is taken back")
+        self.assertLess(unreadable, speed_fn.find("PCI_EXP_LNKSTA_CLS"),
+                        "before the speed field is read out of it")
+        self.assertIn("return 0;", speed_fn[unreadable:],
+                      "and it is reported as no speed, not as the slowest one")
 
     def test_the_gen3_rung_is_asked_of_both_ends_before_the_phy_init_block(self):
         """The first rung has to be a rung the partner is standing on too.

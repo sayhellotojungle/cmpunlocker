@@ -385,7 +385,16 @@ card itself, so any slot works and cards can be mixed freely.
   A card that does not reach its target keeps the speed the link did train, down to but
   not below Gen3, and both ends of the link plus the card's own rate fields are set to
   the speed it holds, so a later retrain does not request a speed the slot cannot carry.
-  Only a link that cannot hold Gen3 returns to the Gen2 path. The fuse value states what
+  Only a link that cannot hold Gen3 returns to the Gen2 path, and that floor covers the
+  **fallback** as much as a partial success: the highest rung a walk confirmed at both
+  ends is remembered, so a later aim that is refused and drags the link below it settles
+  back on that rung instead of handing the card to the Gen2 recipe. A rung is given up
+  only by the link refusing it when it is asked for again, or by config space stopping
+  answering. A `LnkSta` of `0xffff` is neither a speed nor a refusal, at either end:
+  config reads answer all-ones for the few hundred ms a retrain takes,
+  `pcie_capability_read_word()` calls that success, and the speed field of `0xffff` is
+  `0xf` - a link "trained at Gen15" satisfies every `>= Gen3` test in the walk and then
+  programs a target speed the encoding has no room for. The fuse value states what
   a card may request, not what the board it sits in will carry, so the two can differ,
   and the log names the port's own speed vector alongside the card's so a reader can
   tell the two apart. `verify.sh` prints `GEN3 OK, Gen4 missed` for a card whose fuses
@@ -404,7 +413,9 @@ card itself, so any slot works and cards can be mixed freely.
   already at its target is left alone, which costs nothing; a card that has to walk
   the ladder costs about half a second of init when the walk works and up to about
   three seconds per walk when the link refuses, `cmp_pcie_retries` clamping the walk
-  count to 0-4 because this runs with the RM API lock held.
+  count to 0-4 because this runs with the RM API lock held.  A board that held a rung
+  and was refused above it pays one more retrain, the 600 ms settle; that is what buys
+  it a Gen3 link instead of a Gen2 one.
 
 Both switches are on for a normal install, and both are part of the build cache, so
 `--no-80g` and `--no-gen4` are rebuilds rather than reconfigurations. `--no-80g`, or the
